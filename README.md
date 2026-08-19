@@ -11,8 +11,21 @@ Display (`Xvfb`) laufen lässt und als systemd-Dienst betreibt – die eingebaut
 [Home-Server-Funktion](https://github.com/pinokiocomputer/pinokio) von Pinokio 8
 übernimmt danach den eigentlichen Netzwerkzugriff auf Port 42000.
 
-## Was macht das Skript
+## Die zwei Skripte
 
+| Skript | Läuft auf | Zweck |
+|---|---|---|
+| `create-vm.sh` | Proxmox-**Host** | Erstellt die komplette VM (Cloud-Image, q35+OVMF, Cloud-Init) und stößt die Installation automatisch an |
+| `install.sh` | in der **VM** | Installiert Pinokio als Server-Dienst. Wird von `create-vm.sh` automatisch aufgerufen – manueller Aufruf ist nur nötig, wenn du die VM selbst erstellt hast |
+
+`create-vm.sh`:
+- Lädt automatisch ein offizielles Debian/Ubuntu Cloud-Image herunter (gecacht für spätere Läufe)
+- Erstellt die VM bereits mit `q35` + `OVMF (UEFI)` (Voraussetzung für späteres GPU-Passthrough)
+- Richtet Cloud-Init ein (root-SSH-Zugang per Key, DHCP-Netzwerk)
+- Startet die VM und lässt sie beim ersten Boot automatisch `install.sh` ausführen
+- Optional: kann eine GPU direkt bei der Erstellung durchreichen (`PCI_HOSTPCI=...`)
+
+`install.sh`:
 - Erkennt die GPU (NVIDIA/AMD/Intel) und installiert passende Treiber/Firmware
 - Legt einen eigenen, unprivilegierten Systembenutzer `pinokio` an
 - Lädt automatisch die **jeweils neueste** Pinokio-Version von GitHub herunter und installiert sie
@@ -21,21 +34,77 @@ Display (`Xvfb`) laufen lässt und als systemd-Dienst betreibt – die eingebaut
 
 ## Voraussetzungen
 
-- Proxmox VE (getestet mit aktuellen 9.x-Versionen)
-- Eine VM mit **Debian 12/13** oder **Ubuntu 22.04/24.04** (Server-Installation reicht,
-  kein Desktop nötig)
+- Proxmox VE (getestet mit aktuellen 9.x-Versionen), Root-Zugriff auf den Host
+- Internetzugang auf dem Host (Cloud-Image-Download) und in der VM (Pinokio-Download)
 - Empfohlen: mind. 4 vCPUs, 8 GB RAM, 100+ GB Plattenplatz (KI-Modelle werden schnell groß)
-- Root-Zugriff auf die VM (SSH)
 - Optional, aber empfehlenswert: eine durchgereichte GPU (siehe unten)
 
-## Schritt 1: VM in Proxmox anlegen
+## GPU beim Erstellen oder erst später durchreichen?
+
+**Beides geht – die GPU ist nicht zwingend schon bei der VM-Erstellung nötig.**
+
+- Passthrough besteht aus zwei unabhängigen Teilen: (1) IOMMU/vfio-Einrichtung auf dem
+  **Host** – geht jederzeit, auch Monate später, unabhängig vom Zustand der VM – und
+  (2) das PCI-Gerät der VM zuweisen – dafür muss die VM nur kurz gestoppt sein, kein
+  Neuinstallieren nötig.
+- **Einzige Voraussetzung, die von Anfang an stimmen sollte:** Maschinentyp `q35` +
+  BIOS `OVMF (UEFI)`. `create-vm.sh` setzt das automatisch, auch wenn du die GPU
+  (noch) nicht mitgibst. Wird das nachträglich auf einer bereits mit SeaBIOS/Legacy
+  installierten VM umgestellt, bootet sie meist nicht mehr ohne Neuinstallation.
+- Willst du die GPU direkt bei der Erstellung mitgeben (Host-Setup aus Schritt 2 muss
+  dafür schon erledigt sein): `PCI_HOSTPCI=01:00 bash -c "$(curl -fsSL .../create-vm.sh)"`
+- Willst du sie später nachrüsten: einfach Schritt 2 unten durchführen und danach in
+  der laufenden (kurz gestoppten) VM das PCI-Gerät hinzufügen.
+
+## Schritt 1: VM erstellen
+
+### Option A: Vollautomatisch (empfohlen)
+
+Auf dem Proxmox-**Host** per SSH einloggen und als root ausführen:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/create-vm.sh)"
+```
+
+Das erstellt VM, Betriebssystem und Pinokio-Installation komplett automatisch – nach
+ein paar Minuten ist der Server fertig eingerichtet. Alle Werte sind per
+Umgebungsvariable vor dem Aufruf anpassbar:
+
+| Variable | Standard | Bedeutung |
+|---|---|---|
+| `VMID` | nächste freie ID | Proxmox VM-ID |
+| `VM_NAME` | `pinokio` | Hostname/Anzeigename |
+| `CORES` | `4` | vCPUs |
+| `MEMORY` | `8192` | RAM in MB |
+| `DISK_SIZE` | `100` | Festplattengröße in GB |
+| `STORAGE` | `local-lvm` | Ziel-Storage für Disks |
+| `SNIPPET_STORAGE` | `local` | Storage für die Cloud-Init-Konfiguration |
+| `BRIDGE` | `vmbr0` | Netzwerk-Bridge |
+| `OS_IMAGE` | `debian12` | `debian12` \| `debian13` \| `ubuntu2204` \| `ubuntu2404` |
+| `IPCONFIG` | `ip=dhcp` | z.B. `ip=192.168.1.50/24,gw=192.168.1.1` |
+| `PCI_HOSTPCI` | *(leer)* | z.B. `01:00`, um die GPU direkt mitzugeben |
+
+Beispiel mit mehr Ressourcen und Ubuntu statt Debian:
+```bash
+CORES=8 MEMORY=16384 DISK_SIZE=250 OS_IMAGE=ubuntu2404 \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/create-vm.sh)"
+```
+
+Fortschritt verfolgen, sobald die VM eine IP hat:
+```bash
+qm guest cmd <VMID> network-get-interfaces
+ssh -i /root/.ssh/pinokio_vm_key root@<VM-IP> 'tail -f /var/log/pinokio-install.log'
+```
+Sobald in der VM die Datei `/root/.pinokio-install-done` existiert, ist die Installation
+fertig – weiter geht's direkt bei [Schritt 4](#schritt-4-ersteinrichtung-abschließen).
+
+### Option B: Manuell
 
 1. Neue VM erstellen, **Maschinentyp `q35`** und **BIOS `OVMF (UEFI)`** wählen (Voraussetzung
    für GPU-Passthrough).
 2. Debian oder Ubuntu Server installieren (Netzwerk mit fester IP/DHCP-Reservierung
    erleichtert den späteren Zugriff).
-3. Falls eine GPU durchgereicht werden soll: **vor** dem ersten Start der VM die Schritte
-   aus dem nächsten Abschnitt auf dem Proxmox-**Host** durchführen.
+3. Weiter mit [Schritt 3](#schritt-3-pinokio-installieren-einzeiler-in-der-vm).
 
 ## Schritt 2: GPU Passthrough einrichten (optional, auf dem Proxmox-Host)
 
@@ -126,14 +195,14 @@ Ausführliche, laufend aktualisierte Referenz: [Proxmox-Wiki – PCI(e) Passthro
 
 ## Schritt 3: Pinokio installieren (Einzeiler, in der VM)
 
+*(Bei Option A bereits automatisch erledigt – dieser Schritt ist nur bei manuell
+erstellten VMs nötig.)*
+
 In der VM per SSH einloggen und als root ausführen:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/install.sh)"
 ```
-
-*(`HatchetMan111/Pinokio-Proxmox` durch den Namen deines GitHub-Repos ersetzen, nachdem du
-`install.sh`, `uninstall.sh` und diese README dorthin hochgeladen hast.)*
 
 Das Skript erkennt automatisch die GPU, installiert bei Bedarf Treiber, lädt die
 aktuellste Pinokio-Version herunter und startet den Dienst. Falls GPU-Treiber
@@ -205,8 +274,19 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Pr
 - NVIDIA-Treiber lädt nicht: `nvidia-smi` in der VM ausführen; ggf. fehlt bei
   aktiviertem Secure Boot in der VM die Signierung des DKMS-Moduls (Secure Boot in
   der VM-UEFI-Firmware deaktivieren oder MOK-Enrollment durchführen)
+- `create-vm.sh` bricht mit "VMID existiert bereits" ab: andere ID mit `VMID=<id>` angeben
+- VM bekommt beim ersten Boot keine IP / `qm guest cmd` schlägt fehl: dem
+  Cloud-Init-/Boot-Vorgang noch etwas Zeit geben (ca. 1–2 Minuten), danach erneut
+  versuchen; alternativ per `qm terminal <VMID>` auf die serielle Konsole schauen
 
-## Deinstallation
+## VM wieder entfernen (bei Nutzung von `create-vm.sh`)
+
+```bash
+qm stop <VMID>
+qm destroy <VMID>
+```
+
+## Pinokio deinstallieren (VM bleibt bestehen)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/uninstall.sh -o uninstall.sh
