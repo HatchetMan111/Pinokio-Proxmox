@@ -69,7 +69,10 @@ msg_info "Verwende VMID ${VMID}."
 # ----------------------------------------------------------------------------
 if [ -z "$SSH_PUBKEY_FILE" ]; then
   for f in /root/.ssh/id_ed25519.pub /root/.ssh/id_rsa.pub; do
-    [ -f "$f" ] && SSH_PUBKEY_FILE="$f" && break
+    if [ -f "$f" ]; then
+      SSH_PUBKEY_FILE="$f"
+      break
+    fi
   done
 fi
 if [ -z "$SSH_PUBKEY_FILE" ] || [ ! -f "$SSH_PUBKEY_FILE" ]; then
@@ -148,6 +151,7 @@ packages:
   - qemu-guest-agent
 runcmd:
   - systemctl enable --now qemu-guest-agent
+  - sh -c "echo \"IP-Adresse: \$(hostname -I | awk '{print \$1}')\" >> /etc/issue"
   - curl -fsSL ${INSTALL_SCRIPT_URL} -o /root/install.sh
   - bash /root/install.sh > /var/log/pinokio-install.log 2>&1
   - touch /root/.pinokio-install-done
@@ -214,7 +218,9 @@ for iface in data:
             sys.exit(0)
 ' 2>/dev/null || true)"
     fi
-    [ -n "$VM_IP" ] && break
+    if [ -n "$VM_IP" ]; then
+      break
+    fi
   done
 
   # Fallback ohne Gast-Agent: über die MAC-Adresse in der Nachbar-/ARP-Tabelle
