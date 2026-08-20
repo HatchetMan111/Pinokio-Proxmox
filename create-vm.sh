@@ -197,9 +197,15 @@ if [ "$START_VM" = "yes" ]; then
   qm start "$VMID"
   msg_ok "VM gestartet."
 
-  msg_info "Warte auf IP-Adresse (Boot + Cloud-Init, bis zu ca. 2-3 Minuten)..."
-  for i in $(seq 1 36); do
+  MAC="$(qm config "$VMID" | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)"
+  MAX_WAIT_ITER=120   # 120 x 5s = 10 Minuten Obergrenze
+  msg_info "Warte auf IP-Adresse (Boot + Cloud-Init; bei langsamen Leitungen/Paketspiegeln kann das mehrere Minuten dauern)..."
+
+  for i in $(seq 1 "$MAX_WAIT_ITER"); do
     sleep 5
+
+    # 1) Über den QEMU-Gast-Agent (zuverlässigste Quelle, aber erst verfügbar,
+    #    sobald Cloud-Init das Paket qemu-guest-agent installiert und gestartet hat)
     IFACES_JSON="$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null || true)"
     if [ -n "$IFACES_JSON" ]; then
       VM_IP="$(echo "$IFACES_JSON" | python3 -c '
@@ -218,25 +224,33 @@ for iface in data:
             sys.exit(0)
 ' 2>/dev/null || true)"
     fi
+
+    # 2) Fallback über die Nachbar-/ARP-Tabelle des Hosts anhand der MAC-Adresse.
+    #    Wird in JEDER Runde probiert, da das oft schon Sekunden nach dem DHCP-Lease
+    #    funktioniert - lange bevor der Gast-Agent überhaupt installiert ist.
+    if [ -z "$VM_IP" ] && [ -n "$MAC" ]; then
+      VM_IP="$(ip neigh show 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1)"
+    fi
+
     if [ -n "$VM_IP" ]; then
       break
     fi
-  done
 
-  # Fallback ohne Gast-Agent: über die MAC-Adresse in der Nachbar-/ARP-Tabelle
-  # des Hosts nachsehen (funktioniert nur, wenn der Host bereits mit der VM
-  # kommuniziert hat, z.B. weil er selbst der DHCP-Server ist).
-  if [ -z "$VM_IP" ]; then
-    MAC="$(qm config "$VMID" | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)"
-    if [ -n "$MAC" ]; then
-      VM_IP="$(ip neigh show 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1)"
+    # Alle 30 Sekunden ein Lebenszeichen, damit klar ist, dass noch aktiv gewartet wird
+    if [ $((i % 6)) -eq 0 ]; then
+      msg_info "... immer noch am Warten (${i}x5s = $((i * 5))s vergangen)"
     fi
-  fi
+  done
 
   if [ -n "$VM_IP" ]; then
     msg_ok "IP-Adresse gefunden: ${VM_IP}"
   else
-    msg_warn "Konnte die IP-Adresse noch nicht automatisch ermitteln."
+    msg_warn "Konnte die IP-Adresse nach $((MAX_WAIT_ITER * 5 / 60)) Minuten nicht automatisch ermitteln."
+    msg_warn "Mögliche Ursachen: kein DHCP-Server auf Bridge '${BRIDGE}' erreichbar, oder die VM"
+    msg_warn "hängt beim Booten. Live mitschauen (kein Login nötig, nur zum Zusehen):"
+    echo "    qm terminal ${VMID}      # Beenden mit Strg+O, dann Strg+Q"
+    msg_warn "MAC-Adresse für die manuelle Suche im Router/DHCP-Server:"
+    echo "    ${MAC:-unbekannt}"
   fi
 fi
 
