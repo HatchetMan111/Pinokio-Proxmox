@@ -266,11 +266,6 @@ for iface in data:
     msg_ok "IP-Adresse gefunden: ${VM_IP}"
   else
     msg_warn "Konnte die IP-Adresse nach $((MAX_WAIT_ITER * 5 / 60)) Minuten nicht automatisch ermitteln."
-    msg_warn "Mögliche Ursachen: kein DHCP-Server auf Bridge '${BRIDGE}' erreichbar, oder die VM"
-    msg_warn "hängt beim Booten. Live mitschauen (kein Login nötig, nur zum Zusehen):"
-    echo "    qm terminal ${VMID}      # Beenden mit Strg+O, dann Strg+Q"
-    msg_warn "MAC-Adresse für die manuelle Suche im Router/DHCP-Server:"
-    echo "    ${MAC:-unbekannt}"
   fi
 fi
 
@@ -288,17 +283,36 @@ if [ -n "$VM_IP" ]; then
   echo "  VM-IP         : ${VM_IP}"
 fi
 echo
+
 if [ -z "$VM_IP" ]; then
-  msg_info "IP-Adresse später manuell ermitteln:"
-  echo "    qm guest cmd ${VMID} network-get-interfaces"
-  msg_info "Falls das nichts liefert, über die Konsole nachsehen:"
-  echo "    qm terminal ${VMID}      # danach in der VM: ip a"
-  echo "    (Beenden mit Strg+O, dann Strg+Q)"
+  msg_warn "Automatische IP-Erkennung fehlgeschlagen (kein DHCP über den Host sichtbar und/oder"
+  msg_warn "Gast-Agent noch nicht bereit). Das öffnet jetzt automatisch die Konsole - dort einfach"
+  msg_warn "einloggen und die IP selbst ablesen:"
   echo
+  echo "    Login:    root"
+  echo "    Passwort: ${CONSOLE_PASSWORD}"
+  echo
+  echo "  In der Konsole nach dem Login ausführen:"
+  echo "    ip a                              # zeigt die IP-Adresse"
+  echo "    cloud-init status                 # zeigt, ob Cloud-Init noch läuft oder fehlgeschlagen ist"
+  echo "    journalctl -u cloud-init -b       # Details bei Fehlern"
+  echo "    tail -f /var/log/pinokio-install.log   # Pinokio-Installationsfortschritt"
+  echo
+  echo "  Konsole verlassen mit: Strg+O, dann Strg+Q"
+  echo
+  msg_info "Öffne Konsole in 3 Sekunden..."
+  sleep 3
+  qm terminal "$VMID" || true
+  echo
+  msg_info "Sobald du die IP kennst, weiter mit:"
+  echo "    ssh -i ${SSH_PUBKEY_FILE%.pub} root@<VM-IP> 'tail -f /var/log/pinokio-install.log'"
+  echo "    http://<VM-IP>:42000"
+  exit 0
 fi
+
 msg_info "Installationsfortschritt live verfolgen:"
-echo "    ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP:-<VM-IP>} 'tail -f /var/log/pinokio-install.log'"
+echo "    ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP} 'tail -f /var/log/pinokio-install.log'"
 echo
 msg_info "Ist /root/.pinokio-install-done in der VM vorhanden, ist die Installation fertig."
 msg_info "Danach: einmalige Ersteinrichtung per VNC-Tunnel + LAN-Zugriff aktivieren (siehe README.md)."
-echo "    http://${VM_IP:-<VM-IP>}:42000"
+echo "    http://${VM_IP}:42000"
