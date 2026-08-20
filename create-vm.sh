@@ -85,6 +85,14 @@ if [ -z "$SSH_PUBKEY_FILE" ] || [ ! -f "$SSH_PUBKEY_FILE" ]; then
 fi
 SSH_PUBKEY="$(cat "$SSH_PUBKEY_FILE")"
 
+# Notfall-Konsolenpasswort: funktioniert NUR über die lokale Konsole
+# (qm terminal / noVNC), NICHT über SSH (ssh_pwauth bleibt deaktiviert).
+# Rettungsanker, falls Netzwerk/Cloud-Init/SSH-Key mal nicht funktionieren.
+CONSOLE_PASSWORD="$(openssl rand -base64 12 2>/dev/null | tr -d '=+/' | head -c 16)"
+if [ -z "$CONSOLE_PASSWORD" ]; then
+  CONSOLE_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)"
+fi
+
 # ----------------------------------------------------------------------------
 # Cloud-Image herunterladen (mit lokalem Cache)
 # ----------------------------------------------------------------------------
@@ -142,6 +150,10 @@ hostname: ${VM_NAME}
 manage_etc_hosts: true
 disable_root: false
 ssh_pwauth: false
+chpasswd:
+  expire: false
+  list: |
+    root:${CONSOLE_PASSWORD}
 users:
   - name: root
     ssh-authorized-keys:
@@ -271,6 +283,7 @@ echo
 echo "  VMID          : ${VMID}"
 echo "  Name          : ${VM_NAME}"
 echo "  SSH-Key       : ${SSH_PUBKEY_FILE}"
+echo "  Konsolen-PW   : ${CONSOLE_PASSWORD}  (NUR lokal über 'qm terminal ${VMID}' / Proxmox-Konsole, nicht per SSH)"
 if [ -n "$VM_IP" ]; then
   echo "  VM-IP         : ${VM_IP}"
 fi
