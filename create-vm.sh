@@ -197,7 +197,13 @@ if [ "$START_VM" = "yes" ]; then
   qm start "$VMID"
   msg_ok "VM gestartet."
 
-  MAC="$(qm config "$VMID" | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)"
+  # Ab hier sind "noch keine IP", "grep findet nichts", "Agent noch nicht da"
+  # normale Zwischenergebnisse beim Warten - kein echter Fehler. set -e wird
+  # deshalb für diesen gesamten Erkennungsabschnitt gezielt deaktiviert und
+  # danach wiederhergestellt.
+  set +e
+
+  MAC="$(qm config "$VMID" 2>/dev/null | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)"
   MAX_WAIT_ITER=120   # 120 x 5s = 10 Minuten Obergrenze
   msg_info "Warte auf IP-Adresse (Boot + Cloud-Init; bei langsamen Leitungen/Paketspiegeln kann das mehrere Minuten dauern)..."
 
@@ -206,7 +212,7 @@ if [ "$START_VM" = "yes" ]; then
 
     # 1) Über den QEMU-Gast-Agent (zuverlässigste Quelle, aber erst verfügbar,
     #    sobald Cloud-Init das Paket qemu-guest-agent installiert und gestartet hat)
-    IFACES_JSON="$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null || true)"
+    IFACES_JSON="$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null)"
     if [ -n "$IFACES_JSON" ]; then
       VM_IP="$(echo "$IFACES_JSON" | python3 -c '
 import json, sys
@@ -222,7 +228,7 @@ for iface in data:
         if addr.get("ip-address-type") == "ipv4" and not ip.startswith("127."):
             print(ip)
             sys.exit(0)
-' 2>/dev/null || true)"
+' 2>/dev/null)"
     fi
 
     # 2) Fallback über die Nachbar-/ARP-Tabelle des Hosts anhand der MAC-Adresse.
@@ -241,6 +247,8 @@ for iface in data:
       msg_info "... immer noch am Warten (${i}x5s = $((i * 5))s vergangen)"
     fi
   done
+
+  set -e   # ab hier wieder normales Fehlverhalten
 
   if [ -n "$VM_IP" ]; then
     msg_ok "IP-Adresse gefunden: ${VM_IP}"
