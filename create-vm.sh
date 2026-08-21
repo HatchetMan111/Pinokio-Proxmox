@@ -20,10 +20,6 @@
 #
 set -euo pipefail
 
-SCRIPT_BUILD="2026-08-21-v4"
-echo -e "${C_STEP}Pinokio-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
-echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
-
 # ----------------------------------------------------------------------------
 # Ausgabe-Hilfsfunktionen + Fehler-Transparenz
 # ----------------------------------------------------------------------------
@@ -32,6 +28,10 @@ msg_info() { echo -e "${C_INFO}➜${C_RESET} $*"; }
 msg_ok()   { echo -e "${C_OK}✔${C_RESET} $*"; }
 msg_warn() { echo -e "${C_WARN}⚠${C_RESET} $*"; }
 msg_err()  { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
+
+SCRIPT_BUILD="2026-08-21-v5"
+echo -e "${C_STEP}Pinokio-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
+echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
 
 TOTAL_STEPS=9
 step() { echo -e "\n${C_STEP}════ Schritt $1/${TOTAL_STEPS}: $2 ════${C_RESET}"; }
