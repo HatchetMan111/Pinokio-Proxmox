@@ -33,7 +33,16 @@ step() { echo -e "\n${C_STEP}════ Schritt $1/${TOTAL_STEPS}: $2 ══�
 
 # Zeigt bei JEDEM unerwarteten Fehler exakt, in welcher Zeile und bei welchem
 # Befehl das Skript abgebrochen ist - keine stillen Abbrüche mehr.
-trap 'echo -e "\n${C_ERR}✖ FEHLER in Zeile ${LINENO}: Befehl \"${BASH_COMMAND}\" ist mit Exit-Code $? fehlgeschlagen.${C_RESET}" >&2' ERR
+# Ausnahme: In Warte-Schleifen sind fehlgeschlagene Befehle erwartete
+# Zwischenergebnisse (z.B. Gast-Agent noch nicht bereit). Solange QUIET_ERR=1
+# ist, gibt der Trap nichts aus.
+QUIET_ERR=0
+on_err() {
+  local ec=$?
+  [ "$QUIET_ERR" = "1" ] && return 0
+  echo -e "\n${C_ERR}✖ FEHLER in Zeile ${BASH_LINENO[0]}: Befehl \"${BASH_COMMAND}\" ist mit Exit-Code ${ec} fehlgeschlagen.${C_RESET}" >&2
+}
+trap on_err ERR
 
 # ----------------------------------------------------------------------------
 # Schritt 1: Vorabprüfungen
@@ -365,8 +374,10 @@ if [ "$START_VM" = "yes" ]; then
 
   # Ab hier sind "noch keine IP", "grep findet nichts", "Agent noch nicht da"
   # normale Zwischenergebnisse beim Warten - kein echter Fehler. set -e wird
-  # deshalb für diesen gesamten Erkennungsabschnitt gezielt deaktiviert.
+  # deshalb für diesen gesamten Erkennungsabschnitt gezielt deaktiviert und
+  # der ERR-Trap verstummt (QUIET_ERR), damit es keine Fehlerspam-Ausgaben gibt.
   set +e
+  QUIET_ERR=1
 
   MAC="$(qm config "$VMID" 2>/dev/null | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)"
   MAX_WAIT_ITER=36   # 36 x 5s = 3 Minuten, danach automatisch Konsole öffnen
@@ -414,7 +425,8 @@ for iface in data:
     fi
   done
 
-  set -e   # ab hier wieder normales Fehlverhalten
+  set -e        # ab hier wieder normales Fehlverhalten
+  QUIET_ERR=0
 
   if [ -n "$VM_IP" ]; then
     msg_ok "IP-Adresse gefunden: ${VM_IP}"
@@ -431,6 +443,7 @@ if [ -n "$VM_IP" ] && [ "$WAIT_FOR_PINOKIO" = "yes" ]; then
 
   msg_info "Die Installation in der VM dauert einige Minuten. Warte auf Port ${PINOKIO_PORT}..."
   set +e
+  QUIET_ERR=1
   PINOKIO_READY=0
   ELAPSED=0
   while [ "$ELAPSED" -lt "$WAIT_TIMEOUT" ]; do
@@ -446,6 +459,7 @@ if [ -n "$VM_IP" ] && [ "$WAIT_FOR_PINOKIO" = "yes" ]; then
     fi
   done
   set -e
+  QUIET_ERR=0
 
   if [ "$PINOKIO_READY" = "1" ]; then
     msg_ok "Pinokio-Server ist online!"
