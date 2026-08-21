@@ -430,6 +430,93 @@ qm resize "$VMID" scsi0 "${DISK_SIZE}G" >/dev/null
 msg_ok "VM ${VMID} erstellt (${MACHINE} + OVMF/UEFI, ${DISK_SIZE}G Disk)."
 
 # ----------------------------------------------------------------------------
+# Schritt 5b: Image direkt vorbereiten (UNABHÄNGIG von cloud-init!)
+# ----------------------------------------------------------------------------
+# Passwort, SSH-Key, SSH-Hostkeys und DHCP-Netzwerkkonfiguration werden direkt
+# in das importierte Image geschrieben (Disk via qemu-nbd gemountet). Damit
+# funktioniert der erste Boot garantiert - egal ob cloud-init im Gast arbeitet
+# oder nicht. Cloud-init wird zudem explizit deaktiviert, damit es uns nicht
+# in die Quere kommen kann.
+prepare_image() {
+  local mnt="/mnt/pinokio-prepare"
+  local vol_spec vol_dev part p
+  vol_spec="$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/{print $2}' | cut -d, -f1)"
+  vol_dev="$(pvesm path "$vol_spec" 2>/dev/null)"
+  [ -b "$vol_dev" ] || { msg_err "VM-Disk nicht gefunden (${vol_spec} -> ${vol_dev})"; return 1; }
+
+  modprobe nbd max_part=16 >/dev/null 2>&1 || true
+  [ -b /dev/nbd0 ] || { msg_err "/dev/nbd0 nicht verfügbar (Kernel-Modul nbd fehlt?)"; return 1; }
+
+  qemu-nbd -c /dev/nbd0 "$vol_dev" >/dev/null || { msg_err "qemu-nbd Verbinden fehlgeschlagen"; return 1; }
+  sleep 1
+  partprobe /dev/nbd0 >/dev/null 2>&1 || true
+
+  mkdir -p "$mnt"
+  part=""
+  for p in /dev/nbd0p1 /dev/nbd0p2 /dev/nbd0p3 /dev/nbd0; do
+    if [ -b "$p" ] && blkid -o value -s TYPE "$p" 2>/dev/null | grep -qE '^ext[234]$'; then
+      if mount "$p" "$mnt" 2>/dev/null; then part="$p"; break; fi
+    fi
+  done
+  if [ -z "$part" ]; then
+    msg_err "Konnte keine Root-Partition im Image mounten"
+    umount "$mnt" 2>/dev/null || true
+    qemu-nbd -d /dev/nbd0 >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # 1) Root-Passwort direkt setzen (das aus der Zusammenfassung, später per 'passwd' änderbar)
+  echo "root:${CONSOLE_PASSWORD}" | chpasswd --root "$mnt" \
+    || { msg_err "chpasswd fehlgeschlagen"; umount "$mnt"; qemu-nbd -d /dev/nbd0 >/dev/null 2>&1; return 1; }
+
+  # 2) SSH-Key für root hinterlegen
+  mkdir -p "$mnt/root/.ssh"
+  chmod 700 "$mnt/root/.ssh"
+  cp "$SSH_PUBKEY_FILE" "$mnt/root/.ssh/authorized_keys"
+  chmod 600 "$mnt/root/.ssh/authorized_keys"
+
+  # 3) SSH-Hostkeys erzeugen (fixt 'Failed to start ssh.service')
+  ssh-keygen -A -f "$mnt" >/dev/null 2>&1
+  mkdir -p "$mnt/etc/ssh/sshd_config.d"
+  printf 'PermitRootLogin prohibit-password\n' > "$mnt/etc/ssh/sshd_config.d/60-pinokio.conf"
+
+  # 4) Netzwerk: systemd-networkd mit DHCP (läuft im Gast ohnehin schon)
+  mkdir -p "$mnt/etc/systemd/network"
+  cat > "$mnt/etc/systemd/network/89-pinokio.network" <<'EOF'
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
+EOF
+  if [ ! -e "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" ]; then
+    ln -sf /lib/systemd/system/systemd-networkd.service \
+       "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
+  fi
+
+  # 5) Hostname + cloud-init deaktivieren (damit es nichts überschreibt)
+  echo "$VM_NAME" > "$mnt/etc/hostname"
+  mkdir -p "$mnt/etc/cloud"
+  touch "$mnt/etc/cloud/cloud-init.disabled"
+
+  # 6) Hinweis auf Konsole: IP nach Login sichtbar machen
+  printf '\nPinokio-VM bereit. Netzwerk: DHCP (systemd-networkd)\n' > "$mnt/etc/issue.d/pinokio.issue" 2>/dev/null || true
+
+  sync
+  umount "$mnt"
+  qemu-nbd -d /dev/nbd0 >/dev/null 2>&1 || true
+  return 0
+}
+
+if prepare_image; then
+  msg_ok "Image vorbereitet: Root-Passwort gesetzt, SSH-Key + Hostkeys hinterlegt,"
+  msg_ok "DHCP über systemd-networkd aktiviert, cloud-init deaktiviert."
+else
+  msg_err "Image-Vorbereitung fehlgeschlagen - breche ab (VM wurde NICHT gestartet)."
+  exit 1
+fi
+
+# ----------------------------------------------------------------------------
 # Schritt 6: VM starten
 # ----------------------------------------------------------------------------
 step 6 "VM starten"
@@ -766,9 +853,8 @@ if [ -z "$VM_IP" ]; then
   echo "    Login:    root"
   echo "    Passwort: ${CONSOLE_PASSWORD}"
   echo
-  msg_warn "WICHTIG: Das Root-Passwort wird erst von cloud-init gesetzt - das dauert nach"
-  msg_warn "dem ersten Boot ca. 2-5 Minuten. Kommt 'Login incorrect', ist cloud-init"
-  msg_warn "noch nicht fertig: einfach 1-2 Minuten warten und erneut versuchen."
+  msg_warn "WICHTIG: Passwort/Keys wurden direkt ins Image geschrieben und sind ab dem"
+  msg_warn "ersten Boot aktiv - kein Warten auf cloud-init nötig."
   echo
   echo "  In der Konsole nach dem Login ausführen:"
   echo "    ip a                              # zeigt die IP-Adresse"
