@@ -44,7 +44,6 @@ fi
 # shellcheck disable=SC1091
 . /etc/os-release
 OS_ID="${ID:-}"
-OS_VERSION_CODENAME="${VERSION_CODENAME:-}"
 
 case "$OS_ID" in
   debian|ubuntu) ;;
@@ -160,8 +159,14 @@ usermod -aG video,render "$PINOKIO_USER" 2>/dev/null || true
 # Neueste Pinokio-Version ermitteln und installieren
 # ----------------------------------------------------------------------------
 msg_info "Ermittle neueste Pinokio-Version..."
-TAG="$(curl -fsSI https://github.com/pinokiocomputer/pinokio/releases/latest \
-  | grep -i '^location:' | sed -E 's#.*/tag/(v[0-9.]+).*#\1#' | tr -d '\r')"
+TAG="$(curl -fsSL https://api.github.com/repos/pinokiocomputer/pinokio/releases/latest \
+  | grep -oE '"tag_name":\s*"[^"]+"' | head -1 | sed -E 's#.*"([^"]+)"$#\1#' | tr -d '\r')"
+
+# Fallback: Redirect des /releases/latest-Links auswerten, falls die API nicht antwortet
+if [ -z "$TAG" ]; then
+  TAG="$(curl -fsSI https://github.com/pinokiocomputer/pinokio/releases/latest \
+    | grep -i '^location:' | sed -E 's#.*/tag/(v?[0-9][0-9a-zA-Z.-]*).*#\1#' | tr -d '\r')"
+fi
 
 if [ -z "$TAG" ]; then
   msg_err "Konnte die neueste Pinokio-Version nicht ermitteln (GitHub nicht erreichbar?)."
@@ -179,11 +184,40 @@ msg_info "Installiere Pinokio..."
 apt-get install -y -qq "$TMP_DEB" >/dev/null
 rm -f "$TMP_DEB"
 
-if ! command -v pinokio >/dev/null 2>&1; then
-  msg_err "Installation fehlgeschlagen: /usr/bin/pinokio wurde nicht gefunden."
+# Das .deb installiert die Binärdatei je nach Version nach /opt/Pinokio/pinokio
+# (aktuell, kein /usr/bin-Symlink!) oder älter nach /usr/bin/pinokio – daher suchen.
+PINOKIO_BIN=""
+for CAND in /opt/Pinokio/pinokio /usr/bin/pinokio /usr/local/bin/pinokio; do
+  if [ -x "$CAND" ]; then
+    PINOKIO_BIN="$CAND"
+    break
+  fi
+done
+if [ -z "$PINOKIO_BIN" ]; then
+  msg_err "Installation fehlgeschlagen: Pinokio-Binary wurde nicht gefunden (/opt/Pinokio/pinokio)."
   exit 1
 fi
-msg_ok "Pinokio ${VERSION} installiert."
+msg_ok "Pinokio ${VERSION} installiert (${PINOKIO_BIN})."
+
+# ----------------------------------------------------------------------------
+# Pinokio vorkonfigurieren (headless, ohne GUI-Ersteinrichtung)
+# ----------------------------------------------------------------------------
+# Pinokio liest seine Einstellungen aus ~/.pinokio/config.json. Wird dort ein
+# "home" vorgegeben, entfällt der Ordner-Auswahl-Dialog beim ersten Start und
+# der Webserver ist sofort unter http://<VM-IP>:42000 erreichbar.
+msg_info "Konfiguriere Pinokio für Headless-Betrieb..."
+PINOKIO_DATA_HOME="${PINOKIO_HOME}/pinokio"
+install -d -o "$PINOKIO_USER" -g "$PINOKIO_USER" "$PINOKIO_DATA_HOME"
+if [ ! -f "${PINOKIO_HOME}/.pinokio/config.json" ]; then
+  install -d -o "$PINOKIO_USER" -g "$PINOKIO_USER" "${PINOKIO_HOME}/.pinokio"
+  cat > "${PINOKIO_HOME}/.pinokio/config.json" <<EOF
+{
+  "home": "${PINOKIO_DATA_HOME}"
+}
+EOF
+  chown "${PINOKIO_USER}:${PINOKIO_USER}" "${PINOKIO_HOME}/.pinokio/config.json"
+fi
+msg_ok "Pinokio konfiguriert (Datenverzeichnis: ${PINOKIO_DATA_HOME})."
 
 # ----------------------------------------------------------------------------
 # systemd-Dienste einrichten
@@ -237,7 +271,7 @@ User=${PINOKIO_USER}
 Group=${PINOKIO_USER}
 Environment=HOME=${PINOKIO_HOME}
 Environment=DISPLAY=${DISPLAY_NUM}
-ExecStart=/usr/bin/pinokio --no-sandbox
+ExecStart=${PINOKIO_BIN} --no-sandbox
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30
@@ -253,6 +287,31 @@ systemctl enable --now pinokio.service >/dev/null
 msg_ok "Dienste 'pinokio-xvfb' und 'pinokio' aktiviert und gestartet."
 
 # ----------------------------------------------------------------------------
+# Healthcheck: Warten, bis der Pinokio-Webserver auf Port 42000 antwortet
+# ----------------------------------------------------------------------------
+msg_info "Warte auf Pinokio-Webserver (Port ${PINOKIO_PORT})..."
+PINOKIO_UP=0
+for _ in $(seq 1 36); do   # 36 x 5s = max. 3 Minuten
+  if curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${PINOKIO_PORT}" \
+     || curl -fsS -o /dev/null --max-time 3 "http://localhost:${PINOKIO_PORT}"; then
+    PINOKIO_UP=1
+    break
+  fi
+  if ! systemctl is-active --quiet pinokio.service; then
+    msg_err "Dienst 'pinokio' läuft nicht mehr. Logs: journalctl -u pinokio -e"
+    break
+  fi
+  sleep 5
+done
+echo
+if [ "$PINOKIO_UP" = "1" ]; then
+  msg_ok "Pinokio-Webserver ist erreichbar."
+else
+  msg_warn "Pinokio-Webserver antwortet (noch) nicht auf Port ${PINOKIO_PORT}."
+  msg_warn "Logs ansehen: journalctl -u pinokio -f"
+fi
+
+# ----------------------------------------------------------------------------
 # Firewall (falls ufw aktiv ist)
 # ----------------------------------------------------------------------------
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
@@ -265,9 +324,18 @@ fi
 # ----------------------------------------------------------------------------
 VM_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo
-msg_ok "Installation abgeschlossen."
-echo -e "  Pinokio-Version : ${VERSION}"
-echo -e "  Web-UI          : http://${VM_IP:-<VM-IP>}:${PINOKIO_PORT}"
+if [ "$PINOKIO_UP" = "1" ]; then
+  msg_ok "Fertig! Pinokio ist jetzt im Netzwerk erreichbar:"
+  echo
+  echo -e "    ${C_OK}http://${VM_IP:-<VM-IP>}:${PINOKIO_PORT}${C_RESET}"
+  echo
+else
+  msg_ok "Installation abgeschlossen (Webserver noch nicht bereit – siehe Warnung oben)."
+fi
+echo "  Pinokio-Version : ${VERSION}"
+echo "  Web-UI          : http://${VM_IP:-<VM-IP>}:${PINOKIO_PORT}"
+echo "  Datenverzeichnis: ${PINOKIO_DATA_HOME}"
+echo "  Logs            : journalctl -u pinokio -f"
 echo
 if [ "$NEED_REBOOT" = "1" ]; then
   msg_warn "Ein Neustart wird empfohlen, damit die GPU-Treiber vollständig geladen werden:"
@@ -278,7 +346,7 @@ if [ "$GPU_DRIVER_SKIPPED" = "1" ]; then
   msg_warn "GPU-Treiberinstallation wurde übersprungen – siehe Hinweise oben / README.md."
   echo
 fi
-msg_info "Ersteinrichtung (einmalig, per Browser über eine grafische Oberfläche nötig):"
+msg_info "Falls die Web-UI doch einen Einrichtungsdialog zeigt (normalerweise nicht nötig):"
 echo "    1) Auf deinem PC: ssh -L 5900:localhost:5900 root@${VM_IP:-<VM-IP>}"
 echo "    2) In der VM:     systemctl start pinokio-vnc"
 echo "    3) VNC-Viewer auf deinem PC gegen 'localhost:5900' verbinden (kein Passwort)"

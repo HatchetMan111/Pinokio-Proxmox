@@ -7,9 +7,10 @@ danach keinen Monitor, keine Tastatur und keine grafische Sitzung mehr.
 
 Pinokio bietet offiziell keinen "headless"-Modus (die Electron-App braucht immer ein
 Display). Dieses Skript löst das, indem es die App dauerhaft gegen ein virtuelles
-Display (`Xvfb`) laufen lässt und als systemd-Dienst betreibt – die eingebaute
-[Home-Server-Funktion](https://github.com/pinokiocomputer/pinokio) von Pinokio 8
-übernimmt danach den eigentlichen Netzwerkzugriff auf Port 42000.
+Display (`Xvfb`) laufen lässt und als systemd-Dienst betreibt. Pinokios eingebaute
+Server-Funktion lauscht danach automatisch auf Port 42000 – die Konfiguration wird
+vom Skript vorgeschrieben, sodass **keine grafische Ersteinrichtung nötig ist** und
+die VM keinen Monitor, keine Tastatur und keine grafische Sitzung braucht.
 
 ## Die zwei Skripte
 
@@ -23,13 +24,17 @@ Display (`Xvfb`) laufen lässt und als systemd-Dienst betreibt – die eingebaut
 - Erstellt die VM bereits mit `q35` + `OVMF (UEFI)` (Voraussetzung für späteres GPU-Passthrough)
 - Richtet Cloud-Init ein (root-SSH-Zugang per Key, DHCP-Netzwerk)
 - Startet die VM und lässt sie beim ersten Boot automatisch `install.sh` ausführen
+- Wartet am Ende, bis der Pinokio-Webserver erreichbar ist, und gibt die URL (`http://<VM-IP>:42000`) aus
 - Optional: kann eine GPU direkt bei der Erstellung durchreichen (`PCI_HOSTPCI=...`)
 
 `install.sh`:
 - Erkennt die GPU (NVIDIA/AMD/Intel) und installiert passende Treiber/Firmware
 - Legt einen eigenen, unprivilegierten Systembenutzer `pinokio` an
 - Lädt automatisch die **jeweils neueste** Pinokio-Version von GitHub herunter und installiert sie
-- Richtet drei systemd-Dienste ein: `pinokio-xvfb`, `pinokio` und `pinokio-vnc` (nur für die Ersteinrichtung)
+- Konfiguriert Pinokio vor (`~/.pinokio/config.json`), sodass **keine grafische
+  Ersteinrichtung nötig ist** – der Webserver läuft direkt nach dem Start
+- Richtet drei systemd-Dienste ein: `pinokio-xvfb`, `pinokio` und `pinokio-vnc` (nur als Fallback)
+- Wartet am Ende, bis der Webserver auf Port 42000 antwortet, und zeigt die URL an
 - Öffnet bei aktivem `ufw` automatisch Port 42000
 
 ## Voraussetzungen
@@ -66,8 +71,9 @@ Auf dem Proxmox-**Host** per SSH einloggen und als root ausführen:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/create-vm.sh)"
 ```
 
-Das erstellt VM, Betriebssystem und Pinokio-Installation komplett automatisch – nach
-ein paar Minuten ist der Server fertig eingerichtet. Alle Werte sind per
+Das erstellt VM, Betriebssystem und Pinokio-Installation komplett automatisch und
+**wartet am Ende, bis der Pinokio-Server unter `http://<VM-IP>:42000` erreichbar
+ist** – die finale URL wird groß ausgegeben. Alle Werte sind per
 Umgebungsvariable vor dem Aufruf anpassbar:
 
 | Variable | Standard | Bedeutung |
@@ -80,9 +86,11 @@ Umgebungsvariable vor dem Aufruf anpassbar:
 | `STORAGE` | `local-lvm` | Ziel-Storage für Disks |
 | `SNIPPET_STORAGE` | `local` | Storage für die Cloud-Init-Konfiguration |
 | `BRIDGE` | `vmbr0` | Netzwerk-Bridge |
-| `OS_IMAGE` | `debian12` | `debian12` \| `debian13` \| `ubuntu2204` \| `ubuntu2404` |
+| `OS_IMAGE` | `debian12` | `debian12` \| `debian13` \| `ubuntu2204` \| `ubuntu2404` (Architektur wird automatisch an den Host angepasst: amd64/arm64) |
 | `IPCONFIG` | `ip=dhcp` | z.B. `ip=192.168.1.50/24,gw=192.168.1.1` |
 | `PCI_HOSTPCI` | *(leer)* | z.B. `01:00`, um die GPU direkt mitzugeben |
+| `WAIT_FOR_PINOKIO` | `yes` | `no` = nach dem VM-Start nicht auf Port 42000 warten |
+| `WAIT_TIMEOUT` | `1800` | max. Wartezeit auf den Pinokio-Server in Sekunden |
 
 Beispiel mit mehr Ressourcen und Ubuntu statt Debian:
 ```bash
@@ -92,11 +100,13 @@ CORES=8 MEMORY=16384 DISK_SIZE=250 OS_IMAGE=ubuntu2404 \
 
 Fortschritt verfolgen, sobald die VM eine IP hat:
 ```bash
-qm guest cmd <VMID> network-get-interfaces
 ssh -i /root/.ssh/pinokio_vm_key root@<VM-IP> 'tail -f /var/log/pinokio-install.log'
 ```
-Sobald in der VM die Datei `/root/.pinokio-install-done` existiert, ist die Installation
-fertig – weiter geht's direkt bei [Schritt 4](#schritt-4-ersteinrichtung-abschließen).
+Am Ende gibt `create-vm.sh` die fertige URL aus:
+```
+http://<VM-IP>:42000
+```
+Weiter geht's direkt bei [Schritt 5](#schritt-5-von-jedem-gerät-zugreifen).
 
 ### Option B: Manuell
 
@@ -211,34 +221,39 @@ installiert wurden, am Ende einmal neu starten:
 reboot
 ```
 
-## Schritt 4: Ersteinrichtung abschließen
+## Schritt 4: Ersteinrichtung (normalerweise nicht nötig)
 
-Pinokio zeigt beim allerersten Start einen kurzen Einrichtungsdialog (Speicherort
-wählen, Nutzungsbedingungen). Dafür braucht man einmalig eine grafische Verbindung
-zur VM – danach nicht mehr. Das Skript richtet dafür einen VNC-Zugriff ein, der
-**nur über einen SSH-Tunnel** erreichbar ist (kein offener VNC-Port im Netzwerk):
+Das Installationsskript schreibt Pinokios Konfiguration (`~/.pinokio/config.json`)
+vor dem ersten Start vor und richtet den systemd-Dienst so ein, dass der Webserver
+sofort auf Port 42000 lauscht. **Ein grafischer Ersteinrichtungs-Dialog oder VNC ist
+in der Regel nicht mehr erforderlich** – einfach direkt bei Schritt 5 weitermachen.
 
-```bash
-# Auf dem eigenen PC:
-ssh -L 5900:localhost:5900 root@<VM-IP>
+Falls die Web-UI beim ersten Aufruf doch einen Einrichtungsdialog zeigt, gibt es
+zwei Möglichkeiten:
 
-# In der laufenden SSH-Sitzung, auf der VM:
-systemctl start pinokio-vnc
-```
+1. **Direkt im Browser:** den Dialog einfach im Browser unter `http://<VM-IP>:42000`
+   abschließen (die Web-UI ist ja bereits erreichbar).
+2. **Per VNC-Tunnel** (Fallback, falls die Web-UI noch nicht lädt):
 
-Anschließend mit einem beliebigen VNC-Viewer (z.B. TigerVNC, RealVNC) auf dem eigenen
-PC gegen `localhost:5900` verbinden (kein Passwort gesetzt, da nur per Tunnel
-erreichbar). Ersteinrichtung abschließen und in Pinokio unter **Settings → Home
-Server** den LAN-Zugriff aktivieren. Danach den VNC-Dienst wieder stoppen:
+   ```bash
+   # Auf dem eigenen PC:
+   ssh -L 5900:localhost:5900 root@<VM-IP>
 
-```bash
-systemctl stop pinokio-vnc
-```
+   # In der laufenden SSH-Sitzung, auf der VM:
+   systemctl start pinokio-vnc
+   ```
+
+   Anschließend mit einem beliebigen VNC-Viewer (z.B. TigerVNC, RealVNC) auf dem
+   eigenen PC gegen `localhost:5900` verbinden (kein Passwort gesetzt, da nur per
+   Tunnel erreichbar). Danach den VNC-Dienst wieder stoppen:
+
+   ```bash
+   systemctl stop pinokio-vnc
+   ```
 
 ## Schritt 5: Von jedem Gerät zugreifen
 
-Sobald "Home Server" aktiviert ist, einfach im Browser eines beliebigen Geräts im
-selben Netzwerk öffnen:
+Einfach im Browser eines beliebigen Geräts im selben Netzwerk öffnen:
 
 ```
 http://<VM-IP>:42000
@@ -269,6 +284,10 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Pr
 - Logs ansehen: `journalctl -u pinokio -f`
 - Dienst neu starten: `systemctl restart pinokio`
 - Status aller drei Dienste: `systemctl status pinokio pinokio-xvfb pinokio-vnc`
+- Port 42000 antwortet nicht: in der VM `curl -I http://localhost:42000` testen –
+  klappt es lokal aber nicht aus dem Netzwerk, blockiert eine Firewall (Proxmox-
+  Firewall / ufw prüfen); läuft der Dienst nicht, mit `journalctl -u pinokio -e` weitersehen
+- Pinokio zeigt einen Einrichtungsdialog: siehe Schritt 4 (per Browser oder VNC-Tunnel abschließen)
 - Keine GPU erkannt: `lspci -nnk` in der VM prüfen, ob das Gerät überhaupt sichtbar
   ist (falls nicht: Passthrough-Konfiguration auf dem Host prüfen, siehe Schritt 2)
 - NVIDIA-Treiber lädt nicht: `nvidia-smi` in der VM ausführen; ggf. fehlt bei

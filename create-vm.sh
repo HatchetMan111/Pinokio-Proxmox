@@ -28,12 +28,12 @@ msg_ok()   { echo -e "${C_OK}✔${C_RESET} $*"; }
 msg_warn() { echo -e "${C_WARN}⚠${C_RESET} $*"; }
 msg_err()  { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 
-TOTAL_STEPS=8
+TOTAL_STEPS=9
 step() { echo -e "\n${C_STEP}════ Schritt $1/${TOTAL_STEPS}: $2 ════${C_RESET}"; }
 
 # Zeigt bei JEDEM unerwarteten Fehler exakt, in welcher Zeile und bei welchem
 # Befehl das Skript abgebrochen ist - keine stillen Abbrüche mehr.
-trap 'ec=$?; echo -e "\n${C_ERR}✖ FEHLER in Zeile ${LINENO}: Befehl \"${BASH_COMMAND}\" ist mit Exit-Code ${ec} fehlgeschlagen.${C_RESET}" >&2' ERR
+trap 'echo -e "\n${C_ERR}✖ FEHLER in Zeile ${LINENO}: Befehl \"${BASH_COMMAND}\" ist mit Exit-Code $? fehlgeschlagen.${C_RESET}" >&2' ERR
 
 # ----------------------------------------------------------------------------
 # Schritt 1: Vorabprüfungen
@@ -66,6 +66,9 @@ IPCONFIG="${IPCONFIG:-ip=dhcp}"         # oder z.B. ip=192.168.1.50/24,gw=192.16
 SSH_PUBKEY_FILE="${SSH_PUBKEY_FILE:-}"
 INSTALL_SCRIPT_URL="${INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/install.sh}"
 START_VM="${START_VM:-yes}"
+WAIT_FOR_PINOKIO="${WAIT_FOR_PINOKIO:-yes}"   # ja = auf http://<IP>:42000 warten, bis Pinokio installiert ist
+PINOKIO_PORT="${PINOKIO_PORT:-42000}"
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-1800}"          # max. Wartezeit in Sekunden (30 min)
 PCI_HOSTPCI="${PCI_HOSTPCI:-}"           # z.B. "01:00" -> GPU direkt bei Erstellung durchreichen
 NONINTERACTIVE="${NONINTERACTIVE:-}"     # 1 = Assistent überspringen, nur ENV-Variablen/Standardwerte nutzen
 
@@ -102,12 +105,12 @@ i440fx = alter Legacy-Chipsatz, nur bei konkretem Bedarf wählen." \
   DISK_SIZE=$(wt --title "Festplatte" --inputbox "Festplattengröße in GB:" 10 70 "$DISK_SIZE") || { msg_err "Abgebrochen."; exit 1; }
 
   # Storage-Auswahl aus tatsächlich vorhandenen Storages des Hosts
-  local storage_menu=() sname sused
-  while read -r sname _ sused _; do
+  local storage_menu=() sname stype sstatus
+  while read -r sname stype sstatus _; do
     if [ -z "$sname" ] || [ "$sname" = "Name" ]; then
       continue
     fi
-    storage_menu+=("$sname" "$sused")
+    storage_menu+=("$sname" "$stype ($sstatus)")
   done < <(pvesm status 2>/dev/null || true)
   if [ "${#storage_menu[@]}" -gt 0 ]; then
     STORAGE=$(wt --title "Storage" --default-item "$STORAGE" --menu "Ziel-Storage für die VM-Disks:" 20 76 8 "${storage_menu[@]}") || { msg_err "Abgebrochen."; exit 1; }
@@ -227,11 +230,21 @@ fi
 # ----------------------------------------------------------------------------
 step 3 "Cloud-Image herunterladen"
 
+HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+case "$HOST_ARCH" in
+  amd64|x86_64) IMG_ARCH="amd64" ;;
+  arm64|aarch64) IMG_ARCH="arm64" ;;
+  *)
+    msg_err "Nicht unterstützte Host-Architektur: ${HOST_ARCH} (nur amd64/arm64)."
+    exit 1
+    ;;
+esac
+
 case "$OS_IMAGE" in
-  debian12)   IMG_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2" ;;
-  debian13)   IMG_URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2" ;;
-  ubuntu2204) IMG_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img" ;;
-  ubuntu2404) IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img" ;;
+  debian12)   IMG_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-${IMG_ARCH}.qcow2" ;;
+  debian13)   IMG_URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-${IMG_ARCH}.qcow2" ;;
+  ubuntu2204) IMG_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-${IMG_ARCH}.img" ;;
+  ubuntu2404) IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-${IMG_ARCH}.img" ;;
   *)
     msg_err "Unbekanntes OS_IMAGE: ${OS_IMAGE} (erlaubt: debian12, debian13, ubuntu2204, ubuntu2404)"
     exit 1
@@ -321,6 +334,7 @@ CREATE_ARGS=(
   --serial0 socket
   --agent enabled=1
   --ostype l26
+  --onboot 1
   --ipconfig0 "$IPCONFIG"
   --cicustom "user=${SNIPPET_STORAGE}:snippets/${SNIPPET_NAME}"
 )
@@ -410,9 +424,44 @@ for iface in data:
 fi
 
 # ----------------------------------------------------------------------------
-# Schritt 8: Zusammenfassung
+# Schritt 8: Auf Pinokio-Webserver warten
 # ----------------------------------------------------------------------------
-step 8 "Zusammenfassung"
+if [ -n "$VM_IP" ] && [ "$WAIT_FOR_PINOKIO" = "yes" ]; then
+  step 8 "Auf Pinokio-Server warten (http://${VM_IP}:${PINOKIO_PORT})"
+
+  msg_info "Die Installation in der VM dauert einige Minuten. Warte auf Port ${PINOKIO_PORT}..."
+  set +e
+  PINOKIO_READY=0
+  ELAPSED=0
+  while [ "$ELAPSED" -lt "$WAIT_TIMEOUT" ]; do
+    if timeout 3 bash -c "</dev/tcp/${VM_IP}/${PINOKIO_PORT}" 2>/dev/null; then
+      PINOKIO_READY=1
+      break
+    fi
+    sleep 15
+    ELAPSED=$((ELAPSED + 15))
+    # Status alle 2 Minuten ausgeben
+    if [ $((ELAPSED % 120)) -eq 0 ]; then
+      msg_info "... ${ELAPSED}s vergangen - Installation läuft noch (Logs: siehe Zusammenfassung unten)"
+    fi
+  done
+  set -e
+
+  if [ "$PINOKIO_READY" = "1" ]; then
+    msg_ok "Pinokio-Server ist online!"
+  else
+    msg_warn "Port ${PINOKIO_PORT} nach $((WAIT_TIMEOUT / 60)) Minuten nicht erreichbar."
+    msg_warn "Installation läuft evtl. noch – Fortschritt prüfen:"
+    msg_warn "  ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP} 'tail -f /var/log/pinokio-install.log'"
+  fi
+else
+  PINOKIO_READY=0
+fi
+
+# ----------------------------------------------------------------------------
+# Schritt 9: Zusammenfassung
+# ----------------------------------------------------------------------------
+step 9 "Zusammenfassung"
 
 echo
 msg_ok "Fertig. Pinokio installiert sich jetzt selbstständig beim ersten Boot (dauert einige Minuten)."
@@ -426,6 +475,20 @@ if [ -n "$VM_IP" ]; then
   echo "  VM-IP         : ${VM_IP}"
 fi
 echo
+
+# Erfolg: Pinokio ist erreichbar -> großes Abschluss-Banner mit der URL
+if [ "${PINOKIO_READY:-0}" = "1" ]; then
+  echo
+  msg_ok "════════════════════════════════════════════════════════"
+  msg_ok "  Pinokio-Server ist fertig eingerichtet und erreichbar:"
+  msg_ok ""
+  msg_ok "    ${C_OK}http://${VM_IP}:${PINOKIO_PORT}${C_RESET}"
+  msg_ok ""
+  msg_ok "  Einfach im Browser eines beliebigen Geräts im Netzwerk öffnen."
+  msg_ok "════════════════════════════════════════════════════════"
+  echo
+  exit 0
+fi
 
 if [ -z "$VM_IP" ]; then
   msg_warn "Automatische IP-Erkennung fehlgeschlagen (kein DHCP über den Host sichtbar und/oder"
@@ -456,6 +519,14 @@ fi
 msg_info "Installationsfortschritt live verfolgen:"
 echo "    ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP} 'tail -f /var/log/pinokio-install.log'"
 echo
-msg_info "Ist /root/.pinokio-install-done in der VM vorhanden, ist die Installation fertig."
-msg_info "Danach: einmalige Ersteinrichtung per VNC-Tunnel + LAN-Zugriff aktivieren (siehe README.md)."
-echo "    http://${VM_IP}:42000"
+msg_info "Sobald Port ${PINOKIO_PORT} antwortet, ist der Server fertig erreichbar unter:"
+echo "    http://${VM_IP}:${PINOKIO_PORT}"
+echo
+if [ "$WAIT_FOR_PINOKIO" = "yes" ]; then
+  msg_warn "Das Warten auf Port ${PINOKIO_PORT} wurde nach $((WAIT_TIMEOUT / 60)) Minuten abgebrochen."
+else
+  msg_warn "Das Warten auf Port ${PINOKIO_PORT} wurde übersprungen (WAIT_FOR_PINOKIO=no)."
+fi
+msg_info "Selbst prüfen, ob der Server schon online ist:"
+echo "    timeout 3 bash -c '</dev/tcp/${VM_IP}/${PINOKIO_PORT}' && echo online || echo noch nicht bereit"
+echo
