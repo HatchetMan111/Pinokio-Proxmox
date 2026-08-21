@@ -111,6 +111,7 @@ MEMORY="${MEMORY:-8192}"                # MB
 DISK_SIZE="${DISK_SIZE:-100}"           # GB (Gesamtgröße nach Resize)
 STORAGE="${STORAGE:-local-lvm}"
 BRIDGE="${BRIDGE:-vmbr0}"
+NET_MODEL="${NET_MODEL:-virtio}"        # virtio (Standard) oder e1000 (Fallback-Diagnose)
 OS_IMAGE="${OS_IMAGE:-debian12}"        # debian12 | debian13 | ubuntu2204 | ubuntu2404
 IPCONFIG="${IPCONFIG:-ip=dhcp}"         # oder z.B. ip=192.168.1.50/24,gw=192.168.1.1
 SSH_PUBKEY_FILE="${SSH_PUBKEY_FILE:-}"
@@ -361,7 +362,7 @@ CREATE_ARGS=(
   --cores "$CORES"
   --memory "$MEMORY"
   --cpu host
-  --net0 "virtio,bridge=${BRIDGE},firewall=0"
+  --net0 "${NET_MODEL},bridge=${BRIDGE},firewall=0"
   --scsihw virtio-scsi-pci
   --scsi0 "${STORAGE}:0,import-from=${IMG_PATH}"
   --ide2 "${STORAGE}:cloudinit"
@@ -467,29 +468,60 @@ for iface in data:
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcpdump >/dev/null 2>&1 || true
     fi
 
+    # Diagnosebereich: hier sind "nichts gefunden"-Ergebnisse normal -> Trap still
+    QUIET_ERR=1
+
+    # Ist der Tap-Geräte-Port der VM überhaupt an der Bridge angeschlossen?
+    TAP_DEV="tap${VMID}i0"
+    if ip link show "$TAP_DEV" >/dev/null 2>&1; then
+      if ip link show "$TAP_DEV" | grep -q "master ${BRIDGE}"; then
+        msg_ok "${TAP_DEV} ist an ${BRIDGE} angeschlossen."
+      else
+        msg_warn "Diagnose: ${TAP_DEV} existiert, hängt aber NICHT an ${BRIDGE}! (master: $(ip link show "$TAP_DEV" | grep -oE 'master [^ ]+' || echo 'keine'))"
+      fi
+    else
+      msg_warn "Diagnose: Tap-Gerät ${TAP_DEV} existiert nicht - VM-NIC nicht verbunden?"
+    fi
+
     SNIFF_PACKETS=0
     if [ -n "$MAC" ] && command -v tcpdump >/dev/null 2>&1; then
-      msg_info "Lausche 25s auf ${BRIDGE} nach Paketen der VM (MAC ${MAC})..."
-      VM_IP="$(sniff_vm_ip "$MAC" "$BRIDGE" 25)"
-      if [ -n "$VM_IP" ]; then
-        msg_ok "IP aus dem Netzwerk-Traffic der VM ermittelt: ${VM_IP}"
-      elif [ "${SNIFF_PACKETS:-0}" -eq 0 ]; then
-        DIAG_NO_TRAFFIC=1
-        msg_warn "Diagnose: Die VM sendet KEIN EINZIGES Paket über ${BRIDGE}."
-        msg_warn "=> Problem liegt IN der VM (Netzwerk-Treiber/cloud-init) oder an der Bridge-Zuordnung."
-      else
-        DIAG_DHCP_ONLY=1
-        msg_warn "Diagnose: Die VM sendet Pakete (${SNIFF_PACKETS} gesehen), aber ohne nutzbare Quell-IP"
-        msg_warn "(typisch: DHCP-Requests laufen ins Leere). => Im Netz von ${BRIDGE} antwortet kein DHCP."
+      # 1) Direkt am Tap lauschen: Zeigt Pakete, die der GUEST selbst sendet
+      if ip link show "$TAP_DEV" >/dev/null 2>&1; then
+        msg_info "Lausche 20s direkt an ${TAP_DEV} (was sendet der Gast?)..."
+        VM_IP="$(sniff_vm_ip "$MAC" "$TAP_DEV" 20)"
+        if [ -n "$VM_IP" ]; then
+          msg_ok "IP aus dem Traffic des Gastes ermittelt: ${VM_IP}"
+        elif [ "${SNIFF_PACKETS:-0}" -eq 0 ]; then
+          DIAG_NO_TRAFFIC=1
+          msg_warn "Diagnose: Der Gast sendet NICHT EINMAL am Tap-Gerät (${TAP_DEV}) etwas."
+          msg_warn "=> Das Netzwerk im Gast ist tot (cloud-init läuft nicht / kein DHCP-Versuch)."
+          msg_warn "=> Bitte beim nächsten Lauf direkt nach VM-Start 'qm terminal ${VMID}' öffnen"
+          msg_warn "   und die Boot-Zeilen (insbesondere alles mit 'Cloud-init') hier posten."
+        else
+          DIAG_TAP_OK=1
+          msg_info "Der Gast sendet Pakete am Tap (${SNIFF_PACKETS} gesehen) - prüfe Bridge-Weiterleitung..."
+        fi
+      fi
+      # 2) Fallback: an der Bridge lauschen
+      if [ -z "$VM_IP" ] && [ "${DIAG_NO_TRAFFIC:-0}" != "1" ]; then
+        VM_IP="$(sniff_vm_ip "$MAC" "$BRIDGE" 20)"
+        if [ -n "$VM_IP" ]; then
+          msg_ok "IP aus dem Netzwerk-Traffic ermittelt: ${VM_IP}"
+        elif [ "${SNIFF_PACKETS:-0}" -eq 0 ] && [ "${DIAG_TAP_OK:-0}" = "1" ]; then
+          msg_warn "Diagnose: Gast sendet am Tap, aber NICHTS kommt an ${BRIDGE} an -"
+          msg_warn "=> Bridge-Weiterleitung/Firewall blockt (pve-firewall status prüfen!)."
+        fi
       fi
     fi
 
     if [ -z "$VM_IP" ] && [ -n "$MAC" ]; then
       msg_info "Ping-Sweep über das Subnetz der Bridge (dauert ~10s), danach erneuter ARP-Blick..."
       ping_sweep
-      VM_IP="$(ip neigh show 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1)"
+      VM_IP="$(ip neigh show 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1 || true)"
       [ -n "$VM_IP" ] && msg_ok "IP nach Ping-Sweep gefunden: ${VM_IP}"
     fi
+
+    QUIET_ERR=0
 
     if [ -z "$VM_IP" ]; then
       msg_warn "Konnte die IP-Adresse auch mit aktiver Diagnose nicht ermitteln."
