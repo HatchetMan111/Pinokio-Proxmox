@@ -45,6 +45,47 @@ on_err() {
 trap on_err ERR
 
 # ----------------------------------------------------------------------------
+# Aktive Netzwerk-Diagnose: IP der VM auch dann finden, wenn Gast-Agent fehlt
+# und die ARP-Tabelle leer bleibt (z.B. weil cloud-init/DHCP in der VM hängt).
+# ----------------------------------------------------------------------------
+# Lauscht auf dem Bridge-Interface nach Paketen der VM und extrahiert deren
+# Quell-IP (aus ARP-Sender-Adressen oder IP-Paket-Headern).
+sniff_vm_ip() {
+  local mac="$1" bridge="$2" secs="$3" raw="" ip=""
+  command -v tcpdump >/dev/null 2>&1 || return 0
+  raw="$(timeout "$secs" tcpdump -i "$bridge" -n -l -c 200 "ether src ${mac}" 2>/dev/null || true)"
+  SNIFF_PACKETS="$(echo "$raw" | grep -c . || true)"
+  # 1) ARP-Sender-IP: 'who-has X tell Y' -> Y ist die IP der VM
+  ip="$(echo "$raw" | grep -oE 'tell [0-9]+(\.[0-9]+){3}' | awk '{print $2}' \
+      | grep -vE '^(0\.|127\.|169\.254\.)' | head -1 || true)"
+  # 2) Quell-IP aus IP-Paketen (Port-Anteil am Ende abschneiden)
+  if [ -z "$ip" ]; then
+    ip="$(echo "$raw" | grep -oE 'IP [0-9]+(\.[0-9]+){3}(\.[0-9]+)?' \
+        | sed -E 's/^IP //; s/\.[0-9]+$//' | tr -d ' ' \
+        | grep -vE '^(0\.|127\.|255\.|169\.254\.)' | head -1 || true)"
+  fi
+  [ -n "$ip" ] && echo "$ip"
+  return 0
+}
+
+# Pingt alle Hosts der /24-Subnetze der Bridge, damit deren MAC->IP-Zuordnung
+# in der ARP-Tabelle des Hosts landet. Danach lohnt ein erneuter arp-Blick.
+ping_sweep() {
+  local cidr net prefix base i
+  cidr="$(ip -4 -o addr show dev "${BRIDGE}" 2>/dev/null | awk '{print $4; exit}' || true)"
+  [ -z "$cidr" ] && return 0
+  prefix="${cidr#*/}"
+  [ "$prefix" != "24" ] && return 0   # nur /24 zuverlässig sweep-bar
+  net="${cidr%/*}"
+  base="${net%.*}"
+  for i in $(seq 1 254); do
+    ping -c1 -W1 "${base}.${i}" >/dev/null 2>&1 &
+  done
+  wait 2>/dev/null || true
+  return 0
+}
+
+# ----------------------------------------------------------------------------
 # Schritt 1: Vorabprüfungen
 # ----------------------------------------------------------------------------
 step 1 "Vorabprüfungen"
@@ -444,7 +485,48 @@ for iface in data:
   if [ -n "$VM_IP" ]; then
     msg_ok "IP-Adresse gefunden: ${VM_IP}"
   else
-    msg_warn "Konnte die IP-Adresse nach $((MAX_WAIT_ITER * 5 / 60)) Minuten nicht automatisch ermitteln."
+    msg_warn "Gast-Agent und ARP-Tabelle liefern nach $((MAX_WAIT_ITER * 5 / 60)) Minuten nichts."
+    msg_info "Starte aktive Diagnose: Lausche auf ${BRIDGE} und scanne das Subnetz..."
+
+    # tcpdump ggf. nachinstallieren (nicht kritisch, falls nicht möglich)
+    if ! command -v tcpdump >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcpdump >/dev/null 2>&1 || true
+    fi
+
+    SNIFF_PACKETS=0
+    if [ -n "$MAC" ] && command -v tcpdump >/dev/null 2>&1; then
+      msg_info "Lausche 25s auf ${BRIDGE} nach Paketen der VM (MAC ${MAC})..."
+      VM_IP="$(sniff_vm_ip "$MAC" "$BRIDGE" 25)"
+      if [ -n "$VM_IP" ]; then
+        msg_ok "IP aus dem Netzwerk-Traffic der VM ermittelt: ${VM_IP}"
+      elif [ "${SNIFF_PACKETS:-0}" -eq 0 ]; then
+        DIAG_NO_TRAFFIC=1
+        msg_warn "Diagnose: Die VM sendet KEIN EINZIGES Paket über ${BRIDGE}."
+        msg_warn "=> Problem liegt IN der VM (Netzwerk-Treiber/cloud-init) oder an der Bridge-Zuordnung."
+      else
+        DIAG_DHCP_ONLY=1
+        msg_warn "Diagnose: Die VM sendet Pakete (${SNIFF_PACKETS} gesehen), aber ohne nutzbare Quell-IP"
+        msg_warn "(typisch: DHCP-Requests laufen ins Leere). => Im Netz von ${BRIDGE} antwortet kein DHCP."
+      fi
+    fi
+
+    if [ -z "$VM_IP" ] && [ -n "$MAC" ]; then
+      msg_info "Ping-Sweep über das Subnetz der Bridge (dauert ~10s), danach erneuter ARP-Blick..."
+      ping_sweep
+      VM_IP="$(ip neigh show 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1)"
+      [ -n "$VM_IP" ] && msg_ok "IP nach Ping-Sweep gefunden: ${VM_IP}"
+    fi
+
+    if [ -z "$VM_IP" ]; then
+      msg_warn "Konnte die IP-Adresse auch mit aktiver Diagnose nicht ermitteln."
+      if [ "${DIAG_NO_TRAFFIC:-0}" = "1" ]; then
+        msg_warn "Nächster Schritt: Proxmox-WebUI -> VM -> Console öffnen und die Boot-/Cloud-Init-"
+        msg_warn "Ausgabe prüfen. Alternativ anderes OS testen: OS_IMAGE=ubuntu2404 beim Neuerstellen."
+      elif [ "${DIAG_DHCP_ONLY:-0}" = "1" ]; then
+        msg_warn "Nächster Schritt: VM neu erstellen MIT statischer IP, z.B.:"
+        msg_warn "  IPCONFIG=\"ip=<freie-IP>/24,gw=<Gateway>\" bash -c \"\$(curl -fsSL <create-vm-url>)\""
+      fi
+    fi
   fi
 fi
 
