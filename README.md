@@ -84,7 +84,6 @@ Umgebungsvariable vor dem Aufruf anpassbar:
 | `MEMORY` | `8192` | RAM in MB |
 | `DISK_SIZE` | `100` | Festplattengröße in GB |
 | `STORAGE` | `local-lvm` | Ziel-Storage für Disks |
-| `SNIPPET_STORAGE` | `local` | Storage für die Cloud-Init-Konfiguration |
 | `BRIDGE` | `vmbr0` | Netzwerk-Bridge |
 | `OS_IMAGE` | `debian12` | `debian12` \| `debian13` \| `ubuntu2204` \| `ubuntu2404` (Architektur wird automatisch an den Host angepasst: amd64/arm64) |
 | `IPCONFIG` | `ip=dhcp` | z.B. `ip=192.168.1.50/24,gw=192.168.1.1` |
@@ -98,10 +97,6 @@ CORES=8 MEMORY=16384 DISK_SIZE=250 OS_IMAGE=ubuntu2404 \
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/create-vm.sh)"
 ```
 
-Fortschritt verfolgen, sobald die VM eine IP hat:
-```bash
-ssh -i /root/.ssh/pinokio_vm_key root@<VM-IP> 'tail -f /var/log/pinokio-install.log'
-```
 Am Ende gibt `create-vm.sh` die fertige URL aus:
 ```
 http://<VM-IP>:42000

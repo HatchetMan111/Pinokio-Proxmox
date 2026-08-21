@@ -3,9 +3,10 @@
 # Pinokio Proxmox VM Creator
 # --------------------------
 # Läuft auf dem Proxmox-HOST (nicht in einer VM!). Erstellt automatisch eine
-# neue VM aus einem Debian/Ubuntu Cloud-Image (Cloud-Init), und installiert
-# darin beim ersten Boot automatisch Pinokio als Server (führt intern
-# install.sh aus diesem Repo aus).
+# neue VM aus einem Debian/Ubuntu Cloud-Image (Cloud-Init), ermittelt deren
+# IP-Adresse und installiert anschließend per SSH Pinokio als Server
+# (führt intern install.sh aus diesem Repo aus) - am Ende steht die fertige
+# URL http://<VM-IP>:42000 im Terminal.
 #
 # Aufruf (Einzeiler, auf dem Proxmox-Host als root):
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/create-vm.sh)"
@@ -109,7 +110,6 @@ CORES="${CORES:-4}"
 MEMORY="${MEMORY:-8192}"                # MB
 DISK_SIZE="${DISK_SIZE:-100}"           # GB (Gesamtgröße nach Resize)
 STORAGE="${STORAGE:-local-lvm}"
-SNIPPET_STORAGE="${SNIPPET_STORAGE:-local}"
 BRIDGE="${BRIDGE:-vmbr0}"
 OS_IMAGE="${OS_IMAGE:-debian12}"        # debian12 | debian13 | ubuntu2204 | ubuntu2404
 IPCONFIG="${IPCONFIG:-ip=dhcp}"         # oder z.B. ip=192.168.1.50/24,gw=192.168.1.1
@@ -266,7 +266,6 @@ if [ -z "$SSH_PUBKEY_FILE" ] || [ ! -f "$SSH_PUBKEY_FILE" ]; then
   SSH_PUBKEY_FILE="/root/.ssh/pinokio_vm_key.pub"
   msg_warn "Neuer privater Schlüssel liegt auf dem Host unter: /root/.ssh/pinokio_vm_key"
 fi
-SSH_PUBKEY="$(cat "$SSH_PUBKEY_FILE")"
 msg_ok "SSH-Key: ${SSH_PUBKEY_FILE}"
 
 # Notfall-Konsolenpasswort: funktioniert NUR über die lokale Konsole
@@ -315,66 +314,20 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Schritt 4: Snippets auf dem gewünschten Storage aktivieren
+# Schritt 4: Cloud-Init-Zugangsdaten (Proxmox-native, ohne Custom-Snippets)
 # ----------------------------------------------------------------------------
-step 4 "Cloud-Init vorbereiten"
+# Bewusst KEIN cicustom-Snippet: Passwort und SSH-Key werden über die
+# nativen Proxmox-Mechanismen (--cipassword/--sshkeys) gesetzt. Das ist der
+# am weitesten verbreitete und getestete Weg; ein fehlerhaftes/ignoriertes
+# Custom-User-Data war die Ursache dafür, dass weder Passwort noch Netzwerk
+# in der VM ankommen konnten.
+step 4 "Cloud-Init-Zugangsdaten setzen"
 
-STORAGE_JSON="$(pvesh get "/storage/${SNIPPET_STORAGE}" --output-format json 2>/dev/null || true)"
-if [ -z "$STORAGE_JSON" ]; then
-  msg_err "Storage '${SNIPPET_STORAGE}' existiert nicht."
+if [ ! -s "${SSH_PUBKEY_FILE}" ]; then
+  msg_err "SSH-Public-Key-Datei ist leer oder fehlt: ${SSH_PUBKEY_FILE}"
   exit 1
 fi
-CONTENT="$(echo "$STORAGE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content",""))')"
-SNIPPET_PATH="$(echo "$STORAGE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("path",""))')"
-if [ -z "$SNIPPET_PATH" ]; then
-  msg_err "Storage '${SNIPPET_STORAGE}' unterstützt keine Snippets (kein Verzeichnis-Storage)."
-  msg_err "Bitte SNIPPET_STORAGE=local (oder ein anderes Verzeichnis-Storage) verwenden."
-  exit 1
-fi
-if [[ ",${CONTENT}," != *",snippets,"* ]]; then
-  msg_info "Aktiviere Inhaltstyp 'snippets' auf Storage '${SNIPPET_STORAGE}'..."
-  pvesm set "$SNIPPET_STORAGE" --content "${CONTENT:+$CONTENT,}snippets"
-fi
-mkdir -p "${SNIPPET_PATH}/snippets"
-
-SNIPPET_NAME="pinokio-${VMID}-user.yaml"
-cat > "${SNIPPET_PATH}/snippets/${SNIPPET_NAME}" <<EOF
-#cloud-config
-hostname: ${VM_NAME}
-manage_etc_hosts: true
-disable_root: false
-ssh_pwauth: false
-chpasswd:
-  expire: false
-  list: |
-    root:${CONSOLE_PASSWORD}
-users:
-  - name: root
-    ssh-authorized-keys:
-      - ${SSH_PUBKEY}
-package_update: true
-packages:
-  - qemu-guest-agent
-runcmd:
-  - systemctl enable --now qemu-guest-agent
-  - hostname -I >> /etc/issue
-  - curl -fsSL ${INSTALL_SCRIPT_URL} -o /root/install.sh
-  - bash /root/install.sh > /var/log/pinokio-install.log 2>&1
-  - touch /root/.pinokio-install-done
-EOF
-
-# Generierte Cloud-Config auf YAML-Gültigkeit prüfen, BEVOR die VM damit
-# startet (eine ungültige Config würde still dazu führen, dass weder Passwort
-# noch Gast-Agent noch die Installation angewendet werden).
-if python3 -c 'import yaml' >/dev/null 2>&1; then
-  if ! python3 -c "import yaml; yaml.safe_load(open('${SNIPPET_PATH}/snippets/${SNIPPET_NAME}'))" 2>/dev/null; then
-    msg_err "Die generierte Cloud-Init-Config ist kein gültiges YAML:"
-    msg_err "  ${SNIPPET_PATH}/snippets/${SNIPPET_NAME}"
-    exit 1
-  fi
-  msg_ok "Cloud-Init-Konfiguration ist valides YAML."
-fi
-msg_ok "Cloud-Init-Konfiguration erstellt (${SNIPPET_PATH}/snippets/${SNIPPET_NAME})."
+msg_ok "Root-Passwort (nur lokale Konsole) und SSH-Key (${SSH_PUBKEY_FILE}) werden per Cloud-Init gesetzt."
 
 # ----------------------------------------------------------------------------
 # Schritt 5: VM erstellen
@@ -389,7 +342,7 @@ CREATE_ARGS=(
   --cores "$CORES"
   --memory "$MEMORY"
   --cpu host
-  --net0 "virtio,bridge=${BRIDGE}"
+  --net0 "virtio,bridge=${BRIDGE},firewall=0"
   --scsihw virtio-scsi-pci
   --scsi0 "${STORAGE}:0,import-from=${IMG_PATH}"
   --ide2 "${STORAGE}:cloudinit"
@@ -398,8 +351,10 @@ CREATE_ARGS=(
   --agent enabled=1
   --ostype l26
   --onboot 1
+  --ciuser root
+  --cipassword "$CONSOLE_PASSWORD"
+  --sshkeys "$SSH_PUBKEY_FILE"
   --ipconfig0 "$IPCONFIG"
-  --cicustom "user=${SNIPPET_STORAGE}:snippets/${SNIPPET_NAME}"
 )
 
 if [ -n "$PCI_HOSTPCI" ]; then
@@ -531,12 +486,45 @@ for iface in data:
 fi
 
 # ----------------------------------------------------------------------------
-# Schritt 8: Auf Pinokio-Webserver warten
+# Schritt 8: Pinokio per SSH installieren und auf Webserver warten
 # ----------------------------------------------------------------------------
 if [ -n "$VM_IP" ] && [ "$WAIT_FOR_PINOKIO" = "yes" ]; then
-  step 8 "Auf Pinokio-Server warten (http://${VM_IP}:${PINOKIO_PORT})"
+  step 8 "Pinokio installieren (per SSH auf ${VM_IP})"
 
-  msg_info "Die Installation in der VM dauert einige Minuten. Warte auf Port ${PINOKIO_PORT}..."
+  # 8a: Auf SSH warten (sshd läuft in Cloud-Images sofort nach dem Boot)
+  msg_info "Warte auf SSH-Port 22..."
+  set +e
+  QUIET_ERR=1
+  SSH_READY=0
+  for _ in $(seq 1 60); do   # 60 x 5s = max. 5 Minuten
+    if timeout 3 bash -c "</dev/tcp/${VM_IP}/22" 2>/dev/null; then
+      SSH_READY=1
+      break
+    fi
+    sleep 5
+  done
+  QUIET_ERR=0
+  set -e
+
+  if [ "$SSH_READY" != "1" ]; then
+    msg_err "SSH auf ${VM_IP} nach 5 Minuten nicht erreichbar – Installation kann nicht starten."
+    msg_err "Manuell prüfen: ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP}"
+    exit 1
+  fi
+  msg_ok "SSH erreichbar."
+
+  # 8b: install.sh herunterladen und in der VM ausführen (Output wird live gestreamt)
+  TMP_INSTALL="/tmp/pinokio-install-$$.sh"
+  curl -fsSL "${INSTALL_SCRIPT_URL}" -o "${TMP_INSTALL}"
+  msg_info "Führe install.sh in der VM aus (dauert einige Minuten, Output live)..."
+  ssh -i "${SSH_PUBKEY_FILE%.pub}" \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=10 -o LogLevel=ERROR \
+      "root@${VM_IP}" 'bash -s' < "${TMP_INSTALL}"
+  rm -f "${TMP_INSTALL}"
+
+  # 8c: Auf den Pinokio-Webserver warten
+  msg_info "Warte auf Pinokio-Webserver (Port ${PINOKIO_PORT})..."
   set +e
   QUIET_ERR=1
   PINOKIO_READY=0
@@ -550,7 +538,7 @@ if [ -n "$VM_IP" ] && [ "$WAIT_FOR_PINOKIO" = "yes" ]; then
     ELAPSED=$((ELAPSED + 15))
     # Status alle 2 Minuten ausgeben
     if [ $((ELAPSED % 120)) -eq 0 ]; then
-      msg_info "... ${ELAPSED}s vergangen - Installation läuft noch (Logs: siehe Zusammenfassung unten)"
+      msg_info "... ${ELAPSED}s vergangen - Installation läuft noch"
     fi
   done
   set -e
@@ -560,8 +548,7 @@ if [ -n "$VM_IP" ] && [ "$WAIT_FOR_PINOKIO" = "yes" ]; then
     msg_ok "Pinokio-Server ist online!"
   else
     msg_warn "Port ${PINOKIO_PORT} nach $((WAIT_TIMEOUT / 60)) Minuten nicht erreichbar."
-    msg_warn "Installation läuft evtl. noch – Fortschritt prüfen:"
-    msg_warn "  ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP} 'tail -f /var/log/pinokio-install.log'"
+    msg_warn "In der VM prüfen: journalctl -u pinokio -e"
   fi
 else
   PINOKIO_READY=0
@@ -573,7 +560,7 @@ fi
 step 9 "Zusammenfassung"
 
 echo
-msg_ok "Fertig. Pinokio installiert sich jetzt selbstständig beim ersten Boot (dauert einige Minuten)."
+msg_ok "Fertig. Pinokio wurde installiert und der Server gestartet."
 echo
 echo "  VMID          : ${VMID}"
 echo "  Name          : ${VM_NAME}"
@@ -615,7 +602,6 @@ if [ -z "$VM_IP" ]; then
   echo "    ip a                              # zeigt die IP-Adresse"
   echo "    cloud-init status                 # zeigt, ob Cloud-Init noch läuft oder fehlgeschlagen ist"
   echo "    journalctl -u cloud-init -b       # Details bei Fehlern"
-  echo "    tail -f /var/log/pinokio-install.log   # Pinokio-Installationsfortschritt"
   echo
   echo "  Konsole verlassen mit: Strg+O, dann Strg+Q"
   echo
@@ -623,14 +609,14 @@ if [ -z "$VM_IP" ]; then
   sleep 3
   qm terminal "$VMID" || true
   echo
-  msg_info "Sobald du die IP kennst, weiter mit:"
-  echo "    ssh -i ${SSH_PUBKEY_FILE%.pub} root@<VM-IP> 'tail -f /var/log/pinokio-install.log'"
+  msg_info "Sobald du die IP kennst, Pinokio installieren mit:"
+  echo "    curl -fsSL ${INSTALL_SCRIPT_URL} -o /tmp/i.sh && ssh -i ${SSH_PUBKEY_FILE%.pub} root@<VM-IP> 'bash -s' < /tmp/i.sh"
   echo "    http://<VM-IP>:42000"
   exit 0
 fi
 
-msg_info "Installationsfortschritt live verfolgen:"
-echo "    ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP} 'tail -f /var/log/pinokio-install.log'"
+msg_info "Installation später nachholen oder Logs ansehen:"
+echo "    ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP}"
 echo
 msg_info "Sobald Port ${PINOKIO_PORT} antwortet, ist der Server fertig erreichbar unter:"
 echo "    http://${VM_IP}:${PINOKIO_PORT}"
