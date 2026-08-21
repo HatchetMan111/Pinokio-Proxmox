@@ -78,6 +78,7 @@ START_VM="${START_VM:-yes}"
 WAIT_FOR_PINOKIO="${WAIT_FOR_PINOKIO:-yes}"   # ja = auf http://<IP>:42000 warten, bis Pinokio installiert ist
 PINOKIO_PORT="${PINOKIO_PORT:-42000}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-1800}"          # max. Wartezeit in Sekunden (30 min)
+IP_WAIT_TIMEOUT="${IP_WAIT_TIMEOUT:-600}"     # max. Wartezeit auf die VM-IP in Sekunden (10 min)
 PCI_HOSTPCI="${PCI_HOSTPCI:-}"           # z.B. "01:00" -> GPU direkt bei Erstellung durchreichen
 NONINTERACTIVE="${NONINTERACTIVE:-}"     # 1 = Assistent überspringen, nur ENV-Variablen/Standardwerte nutzen
 
@@ -315,11 +316,23 @@ packages:
   - qemu-guest-agent
 runcmd:
   - systemctl enable --now qemu-guest-agent
-  - sh -c "echo \"IP-Adresse: \$(hostname -I | awk '{print \$1}')\" >> /etc/issue"
+  - hostname -I >> /etc/issue
   - curl -fsSL ${INSTALL_SCRIPT_URL} -o /root/install.sh
   - bash /root/install.sh > /var/log/pinokio-install.log 2>&1
   - touch /root/.pinokio-install-done
 EOF
+
+# Generierte Cloud-Config auf YAML-Gültigkeit prüfen, BEVOR die VM damit
+# startet (eine ungültige Config würde still dazu führen, dass weder Passwort
+# noch Gast-Agent noch die Installation angewendet werden).
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+  if ! python3 -c "import yaml; yaml.safe_load(open('${SNIPPET_PATH}/snippets/${SNIPPET_NAME}'))" 2>/dev/null; then
+    msg_err "Die generierte Cloud-Init-Config ist kein gültiges YAML:"
+    msg_err "  ${SNIPPET_PATH}/snippets/${SNIPPET_NAME}"
+    exit 1
+  fi
+  msg_ok "Cloud-Init-Konfiguration ist valides YAML."
+fi
 msg_ok "Cloud-Init-Konfiguration erstellt (${SNIPPET_PATH}/snippets/${SNIPPET_NAME})."
 
 # ----------------------------------------------------------------------------
@@ -380,7 +393,7 @@ if [ "$START_VM" = "yes" ]; then
   QUIET_ERR=1
 
   MAC="$(qm config "$VMID" 2>/dev/null | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)"
-  MAX_WAIT_ITER=36   # 36 x 5s = 3 Minuten, danach automatisch Konsole öffnen
+  MAX_WAIT_ITER=$((IP_WAIT_TIMEOUT / 5))   # Standard: 600s / 5s = 120 Iterationen = 10 Minuten
   msg_info "MAC-Adresse der VM: ${MAC:-unbekannt}"
 
   for i in $(seq 1 "$MAX_WAIT_ITER"); do
@@ -421,7 +434,7 @@ for iface in data:
 
     # Alle 30 Sekunden Status mit sichtbarem Fortschritt, WAS genau versucht wurde
     if [ $((i % 6)) -eq 0 ]; then
-      msg_info "... ${i}x5s=$((i * 5))s vergangen | Gast-Agent: ${AGENT_STATE} | ARP-Tabelle: ${ARP_STATE}"
+      msg_info "... $((i * 5))s / ${IP_WAIT_TIMEOUT}s | Gast-Agent: ${AGENT_STATE} | ARP-Tabelle: ${ARP_STATE}"
     fi
   done
 
@@ -511,6 +524,10 @@ if [ -z "$VM_IP" ]; then
   echo
   echo "    Login:    root"
   echo "    Passwort: ${CONSOLE_PASSWORD}"
+  echo
+  msg_warn "WICHTIG: Das Root-Passwort wird erst von cloud-init gesetzt - das dauert nach"
+  msg_warn "dem ersten Boot ca. 2-5 Minuten. Kommt 'Login incorrect', ist cloud-init"
+  msg_warn "noch nicht fertig: einfach 1-2 Minuten warten und erneut versuchen."
   echo
   echo "  In der Konsole nach dem Login ausführen:"
   echo "    ip a                              # zeigt die IP-Adresse"
