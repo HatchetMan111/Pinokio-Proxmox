@@ -337,6 +337,45 @@ if ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
 fi
 msg_info "Image OK: $(du -h "$IMG_PATH" | awk '{print $1}'), geändert am $(stat -c %y "$IMG_PATH" | cut -d. -f1) ($(qemu-img info "$IMG_PATH" | grep '^virtual size' || true))"
 
+# Prüfsummen-Verifikation gegen die offiziellen Hashes des Image-Anbieters.
+# Ein korrupter/partieller Download kann strukturell intakt wirken (qemu-img
+# check besteht), im Gast aber beliebige Pakete verlieren (z.B. cloud-init!).
+verify_image_checksum() {
+  local sums_url sum_file algo expected actual
+  for entry in "SHA512SUMS:sha512sum" "SHA256SUMS:sha256sum"; do
+    sum_file="${entry%%:*}"; algo="${entry##*:}"
+    sums_url="${IMG_URL%/*}/${sum_file}"
+    local tmp_sums="/tmp/pinokio-${sum_file}.$$"
+    if curl -fsSL --max-time 30 "$sums_url" -o "$tmp_sums" 2>/dev/null; then
+      expected="$(grep -E "[[:space:]]${IMG_FILE//./\\.}\$" "$tmp_sums" | awk '{print $1}' | head -1)"
+      rm -f "$tmp_sums"
+      if [ -n "$expected" ]; then
+        actual="$($algo "$IMG_PATH" | awk '{print $1}')"
+        if [ "$expected" != "$actual" ]; then
+          msg_err "PRÜFSUMME FALSCH: ${IMG_FILE}"
+          msg_err "  erwartet (${algo}): ${expected}"
+          msg_err "  tatsächlich      : ${actual}"
+          return 1
+        fi
+        msg_ok "Prüfsumme verifiziert (${algo}): Image ist original."
+        return 0
+      fi
+    fi
+  done
+  msg_warn "Konnte keine offizielle Prüfsummendatei laden - Überspringe Verifikation."
+  return 0
+}
+
+if ! verify_image_checksum; then
+  msg_warn "Lösche das fehlerhafte Image und lade neu herunter..."
+  rm -f "$IMG_PATH"
+  curl -fL --progress-bar -o "$IMG_PATH" "$IMG_URL"
+  if ! verify_image_checksum || ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
+    msg_err "Auch nach erneutem Download ist das Image fehlerhaft. Abbruch."
+    exit 1
+  fi
+fi
+
 # ----------------------------------------------------------------------------
 # Schritt 4: Cloud-Init-Zugangsdaten (Proxmox-native, ohne Custom-Snippets)
 # ----------------------------------------------------------------------------
