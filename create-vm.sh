@@ -305,6 +305,12 @@ CACHE_DIR="/var/lib/vz/template/pinokio-cache"
 mkdir -p "$CACHE_DIR"
 IMG_PATH="${CACHE_DIR}/${IMG_FILE}"
 
+# IMG_REDOWNLOAD=yes erzwingt frischen Download (z.B. bei Verdacht auf korrupten Cache)
+if [ "${IMG_REDOWNLOAD:-}" = "yes" ] && [ -f "$IMG_PATH" ]; then
+  msg_warn "IMG_REDOWNLOAD=yes: lösche gecachtes Image (${IMG_PATH})."
+  rm -f "$IMG_PATH"
+fi
+
 if [ -f "$IMG_PATH" ]; then
   msg_info "Cloud-Image bereits im Cache, überspringe Download (${IMG_PATH})."
 else
@@ -312,6 +318,19 @@ else
   curl -fL --progress-bar -o "$IMG_PATH" "$IMG_URL"
   msg_ok "Download abgeschlossen."
 fi
+
+# Integritätsprüfung: Ein korruptes/trunkiertes Image bootet evtl. teilweise,
+# produziert aber im Gast beliebige Folgefehler (z.B. cloud-init ohne Netz).
+if ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
+  msg_warn "qemu-img check meldet Fehler im Image (${IMG_PATH}) - lösche und lade neu..."
+  rm -f "$IMG_PATH"
+  curl -fL --progress-bar -o "$IMG_PATH" "$IMG_URL"
+  if ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
+    msg_err "Auch das frisch heruntergeladene Image ist fehlerhaft. Abbruch."
+    exit 1
+  fi
+fi
+msg_info "Image OK: $(du -h "$IMG_PATH" | awk '{print $1}'), geändert am $(stat -c %y "$IMG_PATH" | cut -d. -f1) ($(qemu-img info "$IMG_PATH" | grep '^virtual size' || true))"
 
 # ----------------------------------------------------------------------------
 # Schritt 4: Cloud-Init-Zugangsdaten (Proxmox-native, ohne Custom-Snippets)
