@@ -523,6 +523,80 @@ for iface in data:
 
     QUIET_ERR=0
 
+    # Tiefendiagnose: Wenn der Gast komplett schweigt, mounten wir seine Disk
+    # vom Host aus (read-only) und lesen die Cloud-Init-Logs des Gastes.
+    # Das liefert die definitve Ursache, ohne Login/Netzwerk zu benötigen.
+    if [ "${DIAG_NO_TRAFFIC:-0}" = "1" ] && [ "${DEEP_DIAG:-yes}" != "no" ]; then
+      msg_info "Tiefendiagnose: Stoppe VM, mounte Disk read-only, lese Gast-Logs..."
+      DEEP_FILE="/tmp/pinokio-deepdiag-${VMID}.txt"
+      NBD_DEV="/dev/nbd0"
+      MNT="/mnt/pinokio-diag"
+
+      (
+        set +e
+        qm stop "$VMID" >/dev/null 2>&1
+        SCASI_LINE="$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/{print $2}' | head -1)"
+        VOL_SPEC="${SCASI_LINE%%,*}"
+        VOL_DEV="$(pvesm path "$VOL_SPEC" 2>/dev/null)"
+        [ -z "$VOL_DEV" ] && exit 1
+        modprobe nbd max_part=16 >/dev/null 2>&1
+        [ -b "$NBD_DEV" ] || exit 1
+        qemu-nbd -c "$NBD_DEV" --read-only "$VOL_DEV" >/dev/null 2>&1
+        sleep 1
+        partprobe "$NBD_DEV" >/dev/null 2>&1
+        mkdir -p "$MNT"
+        ROOT_PART=""
+        for p in "${NBD_DEV}p1" "${NBD_DEV}p2" "${NBD_DEV}p15" "$NBD_DEV"; do
+          if [ -b "$p" ] && blkid -o value -s TYPE "$p" 2>/dev/null | grep -qE '^ext[234]$'; then
+            if mount -o ro "$p" "$MNT" 2>/dev/null; then ROOT_PART="$p"; break; fi
+          fi
+        done
+        {
+          echo "=== Root-Partition: ${ROOT_PART:-NICHT GEFUNDEN}"
+          echo
+          echo "=== Ist cloud-init ueberhaupt installiert?"
+          ls -la "$MNT/usr/bin/cloud-init" 2>&1 || true
+          echo
+          echo "=== /etc/cloud Verzeichnis"
+          ls "$MNT/etc/cloud/" 2>&1 || true
+          ls "$MNT/etc/cloud/cloud.cfg.d/" 2>&1 || true
+          echo
+          echo "=== Netzwerk-Konfiguration im Gast"
+          echo "--- /etc/network/interfaces:"
+          cat "$MNT/etc/network/interfaces" 2>&1 || true
+          echo "--- /etc/network/interfaces.d/:"
+          ls "$MNT/etc/network/interfaces.d/" 2>&1 || true
+          cat "$MNT/etc/network/interfaces.d/"* 2>/dev/null || true
+          echo "--- /etc/netplan/:"
+          ls "$MNT/etc/netplan/" 2>&1 || true
+          cat "$MNT/etc/netplan/"* 2>/dev/null || true
+          echo
+          echo "=== /var/log/cloud-init.log (letzte 80 Zeilen)"
+          tail -80 "$MNT/var/log/cloud-init.log" 2>&1 || true
+          echo
+          echo "=== /var/log/cloud-init-output.log (letzte 50 Zeilen)"
+          tail -50 "$MNT/var/log/cloud-init-output.log" 2>&1 || true
+          echo
+          echo "=== /var/lib/cloud Struktur"
+          find "$MNT/var/lib/cloud" -maxdepth 3 2>&1 | head -40 || true
+        } > "$DEEP_FILE" 2>&1
+        umount "$MNT" >/dev/null 2>&1
+        qemu-nbd -d "$NBD_DEV" >/dev/null 2>&1
+      ) || true
+
+      qm start "$VMID" >/dev/null 2>&1 || true
+
+      if [ -s "$DEEP_FILE" ]; then
+        msg_ok "Gast-Logs extrahiert ($DEEP_FILE):"
+        echo -e "${C_STEP}──────────────── BEGINN GAST-DIAGNOSE ────────────────${C_RESET}"
+        cat "$DEEP_FILE"
+        echo -e "${C_STEP}───────────────── ENDE GAST-DIAGNOSE ─────────────────${C_RESET}"
+        msg_warn "Bitte diesen Abschnitt vollständig kopieren und beim Issue melden."
+      else
+        msg_warn "Tiefendiagnose fehlgeschlagen (nbd/mount nicht möglich?). Log manuell prüfen."
+      fi
+    fi
+
     if [ -z "$VM_IP" ]; then
       msg_warn "Konnte die IP-Adresse auch mit aktiver Diagnose nicht ermitteln."
       if [ "${DIAG_NO_TRAFFIC:-0}" = "1" ]; then
