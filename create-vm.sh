@@ -20,6 +20,10 @@
 #
 set -euo pipefail
 
+SCRIPT_BUILD="2026-08-21-v4"
+echo -e "${C_STEP}Pinokio-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
+echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
+
 # ----------------------------------------------------------------------------
 # Ausgabe-Hilfsfunktionen + Fehler-Transparenz
 # ----------------------------------------------------------------------------
@@ -685,7 +689,11 @@ fi
 step 9 "Zusammenfassung"
 
 echo
-msg_ok "Fertig. Pinokio wurde installiert und der Server gestartet."
+if [ "${PINOKIO_READY:-0}" = "1" ]; then
+  msg_ok "Fertig! Pinokio ist installiert und der Server läuft."
+else
+  msg_warn "VM erstellt, aber Pinokio-Installation noch nicht abgeschlossen (siehe Hinweise unten)."
+fi
 echo
 echo "  VMID          : ${VMID}"
 echo "  Name          : ${VM_NAME}"
@@ -732,7 +740,12 @@ if [ -z "$VM_IP" ]; then
   echo
   msg_info "Öffne Konsole in 3 Sekunden..."
   sleep 3
-  qm terminal "$VMID" || true
+  if [ -t 0 ]; then
+    qm terminal "$VMID" || true
+  else
+    msg_warn "Kein interaktives Terminal (Skript lief per curl|bash) - Konsole manuell öffnen:"
+    msg_warn "  Proxmox-WebUI -> VM ${VMID} -> Console   oder:   qm terminal ${VMID}"
+  fi
   echo
   msg_info "Sobald du die IP kennst, Pinokio installieren mit:"
   echo "    curl -fsSL ${INSTALL_SCRIPT_URL} -o /tmp/i.sh && ssh -i ${SSH_PUBKEY_FILE%.pub} root@<VM-IP> 'bash -s' < /tmp/i.sh"
