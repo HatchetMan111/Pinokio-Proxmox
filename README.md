@@ -16,15 +16,30 @@ die VM keinen Monitor, keine Tastatur und keine grafische Sitzung braucht.
 
 | Skript | Läuft auf | Zweck |
 |---|---|---|
-| `create-vm.sh` | Proxmox-**Host** | Erstellt die komplette VM (Cloud-Image, q35+OVMF, Cloud-Init) und stößt die Installation automatisch an |
+| `create-vm.sh` | Proxmox-**Host** | Erstellt die komplette VM (Cloud-Image, q35+OVMF, direkt vorkonfiguriert – ohne auf Cloud-Init angewiesen zu sein) und installiert Pinokio per SSH |
 | `install.sh` | in der **VM** | Installiert Pinokio als Server-Dienst. Wird von `create-vm.sh` automatisch aufgerufen – manueller Aufruf ist nur nötig, wenn du die VM selbst erstellt hast |
 
 `create-vm.sh`:
-- Lädt automatisch ein offizielles Debian/Ubuntu Cloud-Image herunter (gecacht für spätere Läufe)
+- Lädt automatisch ein offizielles Debian/Ubuntu Cloud-Image herunter (gecacht,
+  Integrität wird per Prüfsumme + `qemu-img check` verifiziert)
 - Erstellt die VM bereits mit `q35` + `OVMF (UEFI)` (Voraussetzung für späteres GPU-Passthrough)
-- Richtet Cloud-Init ein (root-SSH-Zugang per Key, DHCP-Netzwerk)
-- Startet die VM und lässt sie beim ersten Boot automatisch `install.sh` ausführen
-- Wartet am Ende, bis der Pinokio-Webserver erreichbar ist, und gibt die URL (`http://<VM-IP>:42000`) aus
+- Schreibt root-Passwort, SSH-Key, SSH-Hostkeys und DHCP-Netzwerkkonfiguration
+  **direkt in das Image** (per `qemu-nbd`, vor dem ersten Boot) und deaktiviert
+  Cloud-Init explizit – das funktioniert unabhängig davon, ob Cloud-Init im Gast
+  zuverlässig arbeitet, und ist der Grund, warum Login/Netzwerk garantiert ab dem
+  allerersten Boot funktionieren
+- Wartet auf SSH, überträgt `install.sh` und führt es aus – Ausgabe wird live im
+  Terminal mitgestreamt, keine Blackbox
+- Wartet danach, bis der Pinokio-Webserver auf Port 42000 antwortet, und gibt die
+  fertige URL groß aus
+- Läuft interaktiv an einem Terminal automatisch als Auswahl-Assistent (whiptail,
+  wie bei den Proxmox Community-Scripts) – Maschinentyp, OS, Ressourcen, Storage,
+  Bridge, IP-Konfiguration und optional GPU lassen sich dort auswählen, ohne
+  Umgebungsvariablen von Hand zu setzen
+- Findet die IP auch dann, wenn Gast-Agent/ARP nichts liefern: aktive Diagnose per
+  `tcpdump`-Mithören am Tap-Gerät/an der Bridge, Ping-Sweep des Subnetzes, und als
+  letzte Eskalationsstufe eine Tiefendiagnose (Disk read-only mounten, echte
+  Cloud-Init-Logs des Gastes auslesen und anzeigen)
 - Optional: kann eine GPU direkt bei der Erstellung durchreichen (`PCI_HOSTPCI=...`)
 
 `install.sh`:
@@ -76,20 +91,31 @@ Das erstellt VM, Betriebssystem und Pinokio-Installation komplett automatisch un
 ist** – die finale URL wird groß ausgegeben. Alle Werte sind per
 Umgebungsvariable vor dem Aufruf anpassbar:
 
+Wird `create-vm.sh` **interaktiv an einem Terminal** ausgeführt (also nicht in
+einem eigenen Automatisierungsskript), öffnet sich automatisch ein Auswahlmenü
+für alle wichtigen Werte – die folgende Tabelle ist dann nur für die
+nicht-interaktive Nutzung bzw. zum Vorbelegen von Standardwerten relevant:
+
 | Variable | Standard | Bedeutung |
 |---|---|---|
 | `VMID` | nächste freie ID | Proxmox VM-ID |
 | `VM_NAME` | `pinokio` | Hostname/Anzeigename |
+| `MACHINE` | `q35` | `q35` (modern, empfohlen) oder `i440fx` (Legacy) |
 | `CORES` | `4` | vCPUs |
 | `MEMORY` | `8192` | RAM in MB |
 | `DISK_SIZE` | `100` | Festplattengröße in GB |
 | `STORAGE` | `local-lvm` | Ziel-Storage für Disks |
 | `BRIDGE` | `vmbr0` | Netzwerk-Bridge |
+| `NET_MODEL` | `virtio` | NIC-Modell (`e1000` nur zur Fehlersuche, falls virtio-Treiber im Gast fehlen) |
 | `OS_IMAGE` | `debian12` | `debian12` \| `debian13` \| `ubuntu2204` \| `ubuntu2404` (Architektur wird automatisch an den Host angepasst: amd64/arm64) |
 | `IPCONFIG` | `ip=dhcp` | z.B. `ip=192.168.1.50/24,gw=192.168.1.1` |
+| `SSH_PUBKEY_FILE` | automatisch erkannt | Pfad zu einem öffentlichen SSH-Key; wird sonst neu erzeugt |
 | `PCI_HOSTPCI` | *(leer)* | z.B. `01:00`, um die GPU direkt mitzugeben |
 | `WAIT_FOR_PINOKIO` | `yes` | `no` = nach dem VM-Start nicht auf Port 42000 warten |
 | `WAIT_TIMEOUT` | `1800` | max. Wartezeit auf den Pinokio-Server in Sekunden |
+| `IP_WAIT_TIMEOUT` | `600` | max. Wartezeit auf die VM-IP in Sekunden, bevor die aktive Diagnose startet |
+| `IMG_REDOWNLOAD` | *(leer)* | `yes` = gecachtes Cloud-Image verwerfen und neu herunterladen (bei Verdacht auf einen beschädigten Cache) |
+| `NONINTERACTIVE` | *(leer)* | `1` = Auswahl-Assistent überspringen, nur ENV-Variablen/Standardwerte nutzen |
 
 Beispiel mit mehr Ressourcen und Ubuntu statt Debian:
 ```bash
@@ -299,9 +325,16 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Pr
   Danach in der Proxmox-Weboberfläche die Konsole neu öffnen – sie zeigt jetzt
   wieder normal Text/Boot-Meldungen an. Neu erstellte VMs sind davon nicht mehr
   betroffen.
-- VM bekommt beim ersten Boot keine IP / `qm guest cmd` schlägt fehl: dem
-  Cloud-Init-/Boot-Vorgang noch etwas Zeit geben (ca. 1–2 Minuten), danach erneut
-  versuchen; alternativ per `qm terminal <VMID>` auf die serielle Konsole schauen
+- VM bekommt beim ersten Boot keine IP: `create-vm.sh` eskaliert das inzwischen
+  automatisch selbst – nach `IP_WAIT_TIMEOUT` (Standard 10 Min.) startet es aktive
+  Diagnose (lauscht per `tcpdump` am Tap-Gerät/an der Bridge, macht einen
+  Ping-Sweep) und zeigt am Ende bei Bedarf sogar die echten Cloud-Init-Logs aus dem
+  Gast an (Disk wird dafür kurz read-only gemountet). Alternativ manuell: `qm
+  terminal <VMID>` (Login: `root`, Passwort steht in der Skript-Ausgabe unter
+  "Konsolen-PW" – funktioniert nur lokal über die Konsole, nicht per SSH)
+- Bei wiederholten, unerklärlichen Fehlern im Gast (fehlende Pakete, kein Netzwerk
+  trotz allem): das gecachte Cloud-Image könnte beschädigt sein. Mit
+  `IMG_REDOWNLOAD=yes` beim nächsten Lauf erzwingt man einen frischen Download.
 
 ## VM wieder entfernen (bei Nutzung von `create-vm.sh`)
 
