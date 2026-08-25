@@ -447,7 +447,18 @@ prepare_image() {
   modprobe nbd max_part=16 >/dev/null 2>&1 || true
   [ -b /dev/nbd0 ] || { msg_err "/dev/nbd0 nicht verfügbar (Kernel-Modul nbd fehlt?)"; return 1; }
 
-  qemu-nbd -c /dev/nbd0 "$vol_dev" >/dev/null || { msg_err "qemu-nbd Verbinden fehlgeschlagen"; return 1; }
+  # Format automatisch erkennen: LVM/LVM-thin/ZFS liefern rohe Block-Devices
+  # (raw), Verzeichnis-/NFS-Storage oft qcow2. Ohne "-f" verweigert qemu-nbd
+  # bei rohen Block-Devices sicherheitshalber die Verbindung.
+  local vol_fmt
+  vol_fmt="$(qemu-img info --output=json "$vol_dev" 2>/dev/null | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("format","raw"))
+except Exception:
+    print("raw")' 2>/dev/null)"
+  [ -z "$vol_fmt" ] && vol_fmt="raw"
+
+  qemu-nbd -c /dev/nbd0 -f "$vol_fmt" "$vol_dev" >/dev/null || { msg_err "qemu-nbd Verbinden fehlgeschlagen (Format: ${vol_fmt}, Device: ${vol_dev})"; return 1; }
   sleep 1
   partprobe /dev/nbd0 >/dev/null 2>&1 || true
 
@@ -671,7 +682,13 @@ for iface in data:
         [ -z "$VOL_DEV" ] && exit 1
         modprobe nbd max_part=16 >/dev/null 2>&1
         [ -b "$NBD_DEV" ] || exit 1
-        qemu-nbd -c "$NBD_DEV" --read-only "$VOL_DEV" >/dev/null 2>&1
+        VOL_FMT="$(qemu-img info --output=json "$VOL_DEV" 2>/dev/null | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("format","raw"))
+except Exception:
+    print("raw")' 2>/dev/null)"
+        [ -z "$VOL_FMT" ] && VOL_FMT="raw"
+        qemu-nbd -c "$NBD_DEV" -f "$VOL_FMT" --read-only "$VOL_DEV" >/dev/null 2>&1
         sleep 1
         partprobe "$NBD_DEV" >/dev/null 2>&1
         mkdir -p "$MNT"
