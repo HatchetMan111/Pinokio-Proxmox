@@ -437,15 +437,37 @@ msg_ok "VM ${VMID} erstellt (${MACHINE} + OVMF/UEFI, ${DISK_SIZE}G Disk)."
 # funktioniert der erste Boot garantiert - egal ob cloud-init im Gast arbeitet
 # oder nicht. Cloud-init wird zudem explizit deaktiviert, damit es uns nicht
 # in die Quere kommen kann.
+# Sucht ein tatsächlich freies /dev/nbdX (size=0 laut sysfs). Trennt zur
+# Sicherheit vorher jede Verbindung auf dem Kandidaten, falls von einem
+# abgebrochenen vorherigen Lauf noch etwas offen hängt ("Failed to set NBD
+# socket" ist meist genau das: eine verwaiste Verbindung von einem früheren,
+# fehlgeschlagenen Durchlauf, die nie sauber getrennt wurde).
+find_free_nbd() {
+  local dev base sizefile sz
+  for dev in /dev/nbd0 /dev/nbd1 /dev/nbd2 /dev/nbd3 /dev/nbd4 /dev/nbd5 /dev/nbd6 /dev/nbd7; do
+    [ -b "$dev" ] || continue
+    base="$(basename "$dev")"
+    sizefile="/sys/class/block/${base}/size"
+    sz="$(cat "$sizefile" 2>/dev/null)"
+    if [ -z "$sz" ] || [ "$sz" = "0" ]; then
+      qemu-nbd -d "$dev" >/dev/null 2>&1 || true
+      echo "$dev"
+      return 0
+    fi
+  done
+  return 1
+}
+
 prepare_image() {
   local mnt="/mnt/pinokio-prepare"
-  local vol_spec vol_dev part p
+  local vol_spec vol_dev part p nbd_dev
   vol_spec="$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/{print $2}' | cut -d, -f1)"
   vol_dev="$(pvesm path "$vol_spec" 2>/dev/null)"
   [ -b "$vol_dev" ] || { msg_err "VM-Disk nicht gefunden (${vol_spec} -> ${vol_dev})"; return 1; }
 
   modprobe nbd max_part=16 >/dev/null 2>&1 || true
-  [ -b /dev/nbd0 ] || { msg_err "/dev/nbd0 nicht verfügbar (Kernel-Modul nbd fehlt?)"; return 1; }
+  nbd_dev="$(find_free_nbd)"
+  [ -n "$nbd_dev" ] || { msg_err "Kein freies /dev/nbdX gefunden (Kernel-Modul nbd fehlt, oder alle 8 Geräte sind belegt)."; return 1; }
 
   # Format automatisch erkennen: LVM/LVM-thin/ZFS liefern rohe Block-Devices
   # (raw), Verzeichnis-/NFS-Storage oft qcow2. Ohne "-f" verweigert qemu-nbd
@@ -458,13 +480,13 @@ except Exception:
     print("raw")' 2>/dev/null)"
   [ -z "$vol_fmt" ] && vol_fmt="raw"
 
-  qemu-nbd -c /dev/nbd0 -f "$vol_fmt" "$vol_dev" >/dev/null || { msg_err "qemu-nbd Verbinden fehlgeschlagen (Format: ${vol_fmt}, Device: ${vol_dev})"; return 1; }
+  qemu-nbd -c "$nbd_dev" -f "$vol_fmt" "$vol_dev" >/dev/null || { msg_err "qemu-nbd Verbinden fehlgeschlagen (Format: ${vol_fmt}, Device: ${vol_dev}, NBD: ${nbd_dev})"; return 1; }
   sleep 1
-  partprobe /dev/nbd0 >/dev/null 2>&1 || true
+  partprobe "$nbd_dev" >/dev/null 2>&1 || true
 
   mkdir -p "$mnt"
   part=""
-  for p in /dev/nbd0p1 /dev/nbd0p2 /dev/nbd0p3 /dev/nbd0; do
+  for p in "${nbd_dev}p1" "${nbd_dev}p2" "${nbd_dev}p3" "$nbd_dev"; do
     if [ -b "$p" ] && blkid -o value -s TYPE "$p" 2>/dev/null | grep -qE '^ext[234]$'; then
       if mount "$p" "$mnt" 2>/dev/null; then part="$p"; break; fi
     fi
@@ -472,13 +494,13 @@ except Exception:
   if [ -z "$part" ]; then
     msg_err "Konnte keine Root-Partition im Image mounten"
     umount "$mnt" 2>/dev/null || true
-    qemu-nbd -d /dev/nbd0 >/dev/null 2>&1 || true
+    qemu-nbd -d "$nbd_dev" >/dev/null 2>&1 || true
     return 1
   fi
 
   # 1) Root-Passwort direkt setzen (das aus der Zusammenfassung, später per 'passwd' änderbar)
   echo "root:${CONSOLE_PASSWORD}" | chpasswd --root "$mnt" \
-    || { msg_err "chpasswd fehlgeschlagen"; umount "$mnt"; qemu-nbd -d /dev/nbd0 >/dev/null 2>&1; return 1; }
+    || { msg_err "chpasswd fehlgeschlagen"; umount "$mnt"; qemu-nbd -d "$nbd_dev" >/dev/null 2>&1; return 1; }
 
   # 2) SSH-Key für root hinterlegen
   mkdir -p "$mnt/root/.ssh"
@@ -515,7 +537,7 @@ EOF
 
   sync
   umount "$mnt"
-  qemu-nbd -d /dev/nbd0 >/dev/null 2>&1 || true
+  qemu-nbd -d "$nbd_dev" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -670,7 +692,6 @@ for iface in data:
     if [ "${DIAG_NO_TRAFFIC:-0}" = "1" ] && [ "${DEEP_DIAG:-yes}" != "no" ]; then
       msg_info "Tiefendiagnose: Stoppe VM, mounte Disk read-only, lese Gast-Logs..."
       DEEP_FILE="/tmp/pinokio-deepdiag-${VMID}.txt"
-      NBD_DEV="/dev/nbd0"
       MNT="/mnt/pinokio-diag"
 
       (
@@ -681,7 +702,8 @@ for iface in data:
         VOL_DEV="$(pvesm path "$VOL_SPEC" 2>/dev/null)"
         [ -z "$VOL_DEV" ] && exit 1
         modprobe nbd max_part=16 >/dev/null 2>&1
-        [ -b "$NBD_DEV" ] || exit 1
+        NBD_DEV="$(find_free_nbd)"
+        [ -z "$NBD_DEV" ] && exit 1
         VOL_FMT="$(qemu-img info --output=json "$VOL_DEV" 2>/dev/null | python3 -c 'import json,sys
 try:
     print(json.load(sys.stdin).get("format","raw"))
