@@ -56,6 +56,13 @@ trap on_err ERR
 # ----------------------------------------------------------------------------
 # Lauscht auf dem Bridge-Interface nach Paketen der VM und extrahiert deren
 # Quell-IP (aus ARP-Sender-Adressen oder IP-Paket-Headern).
+# Strikte IPv4-Prüfung (4 Oktette, je 0-255). Schützt davor, trunkierte
+# Sniff-Treffer wie '192.168.178' in den SSH-Wait zu übernehmen (kostet sonst
+# 5 Minuten Timeout auf einer Adresse, die nie antworten kann).
+valid_ipv4() {
+  echo "$1" | awk -F. 'NF==4 {for(i=1;i<=4;i++){if($i !~ /^[0-9]+$/ || $i<0 || $i>255) exit 1} exit 0} {exit 1}' >/dev/null 2>&1
+}
+
 sniff_vm_ip() {
   local mac="$1" bridge="$2" secs="$3" raw="" ip=""
   command -v tcpdump >/dev/null 2>&1 || return 0
@@ -64,11 +71,24 @@ sniff_vm_ip() {
   # 1) ARP-Sender-IP: 'who-has X tell Y' -> Y ist die IP der VM
   ip="$(echo "$raw" | grep -oE 'tell [0-9]+(\.[0-9]+){3}' | awk '{print $2}' \
       | grep -vE '^(0\.|127\.|169\.254\.)' | head -1 || true)"
-  # 2) Quell-IP aus IP-Paketen (Port-Anteil am Ende abschneiden)
+  # 2) Quell-IP aus IP-Paketen MIT Port (tcpdump: 'IP A.B.C.D.port > ...') –
+  #    nur die Port-Gruppe entfernen. (Alter Code hat hier auch bei portlosen
+  #    Zeilen das letzte Oktett abgeschnitten -> '192.168.178'.)
   if [ -z "$ip" ]; then
-    ip="$(echo "$raw" | grep -oE 'IP [0-9]+(\.[0-9]+){3}(\.[0-9]+)?' \
-        | sed -E 's/^IP //; s/\.[0-9]+$//' | tr -d ' ' \
+    ip="$(echo "$raw" | grep -oE 'IP ([0-9]+\.){3}[0-9]+\.[0-9]+' \
+        | sed -E 's/^IP //; s/\.[0-9]+$//' \
         | grep -vE '^(0\.|127\.|255\.|169\.254\.)' | head -1 || true)"
+  fi
+  # 3) Portlose IP-Zeilen (z.B. ICMP: 'IP A.B.C.D > ...') als volle IP übernehmen.
+  if [ -z "$ip" ]; then
+    ip="$(echo "$raw" | grep -oE 'IP ([0-9]+\.){3}[0-9]+ ' \
+        | sed -E 's/^IP //; s/ $//' \
+        | grep -vE '^(0\.|127\.|255\.|169\.254\.)' | head -1 || true)"
+  fi
+  # 4) Sicherheitsnetz: nur gültige IPv4 weitergeben.
+  if [ -n "$ip" ] && ! valid_ipv4 "$ip"; then
+    msg_warn "Sniff-Treffer '${ip}' verworfen (ungültige IP)."
+    ip=""
   fi
   [ -n "$ip" ] && echo "$ip"
   return 0
@@ -907,6 +927,13 @@ except Exception:
     fi
     fi
   fi
+fi
+
+# Letztes Sicherheitsnetz: keine ungültige IP in den SSH-Wait übernehmen
+# (fängt auch ARP-/Sweep-Treffer ab, falls dort je Müll durchkommt).
+if [ -n "$VM_IP" ] && ! valid_ipv4 "$VM_IP"; then
+  msg_err "Erkannte IP '${VM_IP}' ist ungültig – verwerfe sie (kein SSH-Versuch auf Müll)."
+  VM_IP=""
 fi
 
 # ----------------------------------------------------------------------------
