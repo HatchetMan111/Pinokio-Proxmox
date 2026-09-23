@@ -29,9 +29,10 @@ msg_ok()   { echo -e "${C_OK}✔${C_RESET} $*"; }
 msg_warn() { echo -e "${C_WARN}⚠${C_RESET} $*"; }
 msg_err()  { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 
-SCRIPT_BUILD="2026-08-21-v5"
+SCRIPT_BUILD="2026-09-23-v6"
 echo -e "${C_STEP}Pinokio-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
 echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
+echo -e "${C_STEP}Log: /var/log/pinokio-create-vm-<VMID>.log (wird nach Feststehen der VMID angelegt)${C_RESET}"
 
 TOTAL_STEPS=9
 step() { echo -e "\n${C_STEP}════ Schritt $1/${TOTAL_STEPS}: $2 ════${C_RESET}"; }
@@ -99,9 +100,16 @@ if [ "$(id -u)" -ne 0 ]; then
   msg_err "Bitte als root ausführen."
   exit 1
 fi
-for cmd in qm pvesh pvesm python3 lspci; do
+for cmd in qm pvesh pvesm python3 lspci qemu-nbd qemu-img ip; do
   command -v "$cmd" >/dev/null 2>&1 || { msg_err "'$cmd' nicht gefunden – dieses Skript muss auf dem Proxmox-Host laufen."; exit 1; }
 done
+if command -v pveversion >/dev/null 2>&1; then
+  msg_info "Proxmox-Version: $(pveversion 2>/dev/null | head -1 || echo unbekannt)"
+fi
+# tcpdump/bridge werden für die aktive IP-Diagnose gebraucht (kein harter Abbruch hier,
+# sie werden bei Bedarf in Schritt 7 nachinstalliert/geprüft).
+command -v tcpdump >/dev/null 2>&1 || msg_warn "tcpdump fehlt – wird bei Bedarf in Schritt 7 nachinstalliert."
+command -v bridge >/dev/null 2>&1 || msg_warn "'bridge' (iproute2) fehlt – FDB-Fallback in Schritt 7 eingeschränkt."
 msg_ok "Läuft auf einem Proxmox-Host."
 
 # ----------------------------------------------------------------------------
@@ -250,6 +258,32 @@ if qm status "$VMID" >/dev/null 2>&1; then
   exit 1
 fi
 msg_ok "Konfiguration steht. Verwende VMID ${VMID} (Maschine: ${MACHINE})."
+
+# Ab hier alles zusätzlich in eine Log-Datei spiegeln (Fehlersuche beim Erstlauf).
+LOG_FILE="/var/log/pinokio-create-vm-${VMID}.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+# shellcheck disable=SC2094
+exec > >(tee -a "$LOG_FILE") 2>&1
+msg_info "Log-Datei: ${LOG_FILE}"
+msg_info "Effektive Konfiguration: VMID=${VMID} NAME=${VM_NAME} MACHINE=${MACHINE} OS=${OS_IMAGE} CORES=${CORES} MEM=${MEMORY} DISK=${DISK_SIZE}G STORAGE=${STORAGE} BRIDGE=${BRIDGE} NET=${NET_MODEL} IPCONFIG=${IPCONFIG}"
+
+# Später Preflight: Storage + Bridge existieren wirklich?
+if ! pvesm status 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$STORAGE"; then
+  msg_err "Storage '${STORAGE}' existiert nicht (pvesm status). Verfügbare Storages:"
+  pvesm status 2>/dev/null || true
+  exit 1
+fi
+if [ ! -e "/sys/class/net/${BRIDGE}" ]; then
+  msg_err "Bridge '${BRIDGE}' existiert nicht (/sys/class/net). Vorhanden:"
+  ls /sys/class/net/ 2>/dev/null || true
+  exit 1
+fi
+BRIDGE_CIDR="$(ip -4 -o addr show dev "${BRIDGE}" 2>/dev/null | awk '{print $4; exit}' || true)"
+if [ -n "$BRIDGE_CIDR" ]; then
+  msg_ok "Bridge ${BRIDGE} hat IP ${BRIDGE_CIDR} (Ping-Sweep möglich bei /24)."
+else
+  msg_warn "Bridge ${BRIDGE} hat keine IPv4 – Ping-Sweep/FDB-Fallback eingeschränkt."
+fi
 
 # ----------------------------------------------------------------------------
 # Schritt 2: SSH-Key ermitteln (für root-Login in der VM)
@@ -513,19 +547,54 @@ except Exception:
   mkdir -p "$mnt/etc/ssh/sshd_config.d"
   printf 'PermitRootLogin prohibit-password\n' > "$mnt/etc/ssh/sshd_config.d/60-pinokio.conf"
 
-  # 4) Netzwerk: systemd-networkd mit DHCP (läuft im Gast ohnehin schon)
+  # 4) Netzwerk: systemd-networkd (DHCP default, statisch wenn IPCONFIG statisch ist).
+  # IPCONFIG (Proxmox-Format: ip=dhcp oder ip=ADDR/PREFIX,gw=GATEWAY) wurde bisher
+  # nur an 'qm create' übergeben, aber cloud-init ist deaktiviert – statische Wahl
+  # kam daher nie im Gast an. Fix: direkt ins Image schreiben.
   mkdir -p "$mnt/etc/systemd/network"
-  cat > "$mnt/etc/systemd/network/89-pinokio.network" <<'EOF'
+  rm -f "$mnt/etc/systemd/network/89-pinokio.network"
+  PINOKIO_IPCFG="${IPCONFIG:-ip=dhcp}"
+  PINOKIO_STATIC_IP="$(echo "$PINOKIO_IPCFG" | grep -oE 'ip=[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | cut -d= -f2 || true)"
+  PINOKIO_GW="$(echo "$PINOKIO_IPCFG" | grep -oE 'gw=[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | cut -d= -f2 || true)"
+  if [ -n "$PINOKIO_STATIC_IP" ]; then
+    if [ -z "$PINOKIO_GW" ]; then
+      msg_warn "Statische IP ohne Gateway in IPCONFIG (${PINOKIO_IPCFG}) – schreibe Adresse ohne Default-Route."
+    fi
+    {
+      echo "[Match]"
+      echo "Name=e* en* eth*"
+      echo ""
+      echo "[Network]"
+      echo "Address=${PINOKIO_STATIC_IP}"
+      if [ -n "$PINOKIO_GW" ]; then
+        echo "Gateway=${PINOKIO_GW}"
+      fi
+      echo "DNS=${PINOKIO_GW:-1.1.1.1}"
+    } > "$mnt/etc/systemd/network/89-pinokio.network"
+    msg_info "Netzwerk im Gast: statisch ${PINOKIO_STATIC_IP} gw ${PINOKIO_GW:-keins}"
+  else
+    cat > "$mnt/etc/systemd/network/89-pinokio.network" <<'EOF'
 [Match]
-Name=en* eth*
+Name=e* en* eth*
 
 [Network]
 DHCP=yes
 EOF
-  if [ ! -e "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" ]; then
-    ln -sf /lib/systemd/system/systemd-networkd.service \
-       "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
+    msg_info "Netzwerk im Gast: DHCP via systemd-networkd"
   fi
+  # networkd robust aktivieren (merged-usr: /usr/lib, alt: /lib). systemctl --root zuerst.
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --root="$mnt" enable systemd-networkd.service >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$mnt/etc/systemd/system/multi-user.target.wants"
+  for _unit_src in "$mnt/usr/lib/systemd/system/systemd-networkd.service" "$mnt/lib/systemd/system/systemd-networkd.service"; do
+    if [ -f "$_unit_src" ]; then
+      ln -sf "$_unit_src" "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
+      break
+    fi
+  done
+  # Alte cloud-init-Netzreste entfernen, damit kein Renderer dazwischenfunkt.
+  rm -f "$mnt/etc/network/interfaces.d/50-cloud-init.cfg" 2>/dev/null || true
 
   # 5) Hostname + cloud-init deaktivieren (damit es nichts überschreibt)
   echo "$VM_NAME" > "$mnt/etc/hostname"
@@ -533,7 +602,7 @@ EOF
   touch "$mnt/etc/cloud/cloud-init.disabled"
 
   # 6) Hinweis auf Konsole: IP nach Login sichtbar machen
-  printf '\nPinokio-VM bereit. Netzwerk: DHCP (systemd-networkd)\n' > "$mnt/etc/issue.d/pinokio.issue" 2>/dev/null || true
+  printf '\nPinokio-VM bereit. Netzwerk: %s (systemd-networkd)\n' "${PINOKIO_STATIC_IP:-DHCP}" > "$mnt/etc/issue.d/pinokio.issue" 2>/dev/null || true
 
   sync
   umount "$mnt"
@@ -543,7 +612,8 @@ EOF
 
 if prepare_image; then
   msg_ok "Image vorbereitet: Root-Passwort gesetzt, SSH-Key + Hostkeys hinterlegt,"
-  msg_ok "DHCP über systemd-networkd aktiviert, cloud-init deaktiviert."
+  msg_ok "Netzwerk über systemd-networkd aktiviert (${IPCONFIG}), cloud-init deaktiviert."
+  msg_info "Geschriebene Netzconfig: /etc/systemd/network/89-pinokio.network (im Gast prüfen mit: cat /etc/systemd/network/89-pinokio.network; networkctl status)"
 else
   msg_err "Image-Vorbereitung fehlgeschlagen - breche ab (VM wurde NICHT gestartet)."
   exit 1
@@ -574,11 +644,18 @@ if [ "$START_VM" = "yes" ]; then
   MAC="$(qm config "$VMID" 2>/dev/null | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)"
   MAX_WAIT_ITER=$((IP_WAIT_TIMEOUT / 5))   # Standard: 600s / 5s = 120 Iterationen = 10 Minuten
   msg_info "MAC-Adresse der VM: ${MAC:-unbekannt}"
+  msg_info "Hinweis: qemu-guest-agent ist im Cloud-Image ab Werk NICHT installiert –"
+  msg_info "die Erkennung läuft primär über ARP/Bridge-FDB/Tap-Sniff, der Agent ist nur Bonus."
+  # Statische IP aus IPCONFIG schon bekannt? Dann direkt als Kandidat merken (Verifikation folgt).
+  STATIC_CANDIDATE="$(echo "${IPCONFIG:-}" | grep -oE 'ip=[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | cut -d= -f2 | cut -d/ -f1 || true)"
+  if [ -n "${STATIC_CANDIDATE:-}" ]; then
+    msg_info "Statische Wunsch-IP laut IPCONFIG: ${STATIC_CANDIDATE} (wird nach Boot per Ping verifiziert, nicht blind übernommen)."
+  fi
 
   for i in $(seq 1 "$MAX_WAIT_ITER"); do
     sleep 5
 
-    AGENT_STATE="nicht erreichbar"
+    AGENT_STATE="nicht erwartet/fehlt (ok)"
     IFACES_JSON="$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null)"
     if [ -n "$IFACES_JSON" ]; then
       AGENT_STATE="läuft"
@@ -600,10 +677,17 @@ for iface in data:
     fi
 
     ARP_STATE="kein Eintrag"
+    FDB_STATE="kein Eintrag"
     if [ -z "$VM_IP" ] && [ -n "$MAC" ]; then
       VM_IP="$(ip neigh show 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1)"
       if [ -n "$VM_IP" ]; then
         ARP_STATE="gefunden"
+      fi
+    fi
+    # Bridge-FDB sieht die MAC oft früher als die ARP-Tabelle (L2 vs L3).
+    if [ -z "$VM_IP" ] && [ -n "$MAC" ] && command -v bridge >/dev/null 2>&1; then
+      if bridge fdb show br "$BRIDGE" 2>/dev/null | grep -qi "$MAC"; then
+        FDB_STATE="MAC an Bridge sichtbar (Gast sendet L2)"
       fi
     fi
 
@@ -613,7 +697,8 @@ for iface in data:
 
     # Alle 30 Sekunden Status mit sichtbarem Fortschritt, WAS genau versucht wurde
     if [ $((i % 6)) -eq 0 ]; then
-      msg_info "... $((i * 5))s / ${IP_WAIT_TIMEOUT}s | Gast-Agent: ${AGENT_STATE} | ARP-Tabelle: ${ARP_STATE}"
+      QM_STATE="$(qm status "$VMID" 2>/dev/null || echo unbekannt)"
+      msg_info "... $((i * 5))s / ${IP_WAIT_TIMEOUT}s | ${QM_STATE} | Agent: ${AGENT_STATE} | ARP: ${ARP_STATE} | FDB: ${FDB_STATE}"
     fi
   done
 
@@ -623,7 +708,19 @@ for iface in data:
   if [ -n "$VM_IP" ]; then
     msg_ok "IP-Adresse gefunden: ${VM_IP}"
   else
-    msg_warn "Gast-Agent und ARP-Tabelle liefern nach $((MAX_WAIT_ITER * 5 / 60)) Minuten nichts."
+    msg_warn "ARP/FDB liefern nach $((MAX_WAIT_ITER * 5 / 60)) Minuten nichts (Agent ist optional und fehlt meist – das ist ok)."
+    # Statische Wunsch-IP zuerst direkt verifizieren (Ping + SSH-Port), bevor gesnifft wird.
+    if [ -n "${STATIC_CANDIDATE:-}" ]; then
+      msg_info "Prüfe statische Wunsch-IP ${STATIC_CANDIDATE} direkt (Ping + Port 22)..."
+      ping -c2 -W2 "${STATIC_CANDIDATE}" >/dev/null 2>&1 || true
+      if timeout 3 bash -c "</dev/tcp/${STATIC_CANDIDATE}/22" 2>/dev/null; then
+        VM_IP="${STATIC_CANDIDATE}"
+        msg_ok "Statische IP antwortet auf SSH – übernehme ${VM_IP}."
+      else
+        msg_warn "Statische IP ${STATIC_CANDIDATE} antwortet nicht auf SSH – fahre mit Sniffing fort."
+      fi
+    fi
+  if [ -z "$VM_IP" ]; then
     msg_info "Starte aktive Diagnose: Lausche auf ${BRIDGE} und scanne das Subnetz..."
 
     # tcpdump ggf. nachinstallieren (nicht kritisch, falls nicht möglich)
@@ -657,9 +754,9 @@ for iface in data:
         elif [ "${SNIFF_PACKETS:-0}" -eq 0 ]; then
           DIAG_NO_TRAFFIC=1
           msg_warn "Diagnose: Der Gast sendet NICHT EINMAL am Tap-Gerät (${TAP_DEV}) etwas."
-          msg_warn "=> Das Netzwerk im Gast ist tot (cloud-init läuft nicht / kein DHCP-Versuch)."
+          msg_warn "=> Das Gast-Netzwerk ist tot (systemd-networkd startet nicht / kein DHCP-/statisch-Versuch)."
           msg_warn "=> Bitte beim nächsten Lauf direkt nach VM-Start 'qm terminal ${VMID}' öffnen"
-          msg_warn "   und die Boot-Zeilen (insbesondere alles mit 'Cloud-init') hier posten."
+          msg_warn "   und 'networkctl status; ip a; cat /etc/systemd/network/89-pinokio.network' posten."
         else
           DIAG_TAP_OK=1
           msg_info "Der Gast sendet Pakete am Tap (${SNIFF_PACKETS} gesehen) - prüfe Bridge-Weiterleitung..."
@@ -723,7 +820,13 @@ except Exception:
         {
           echo "=== Root-Partition: ${ROOT_PART:-NICHT GEFUNDEN}"
           echo
-          echo "=== Ist cloud-init ueberhaupt installiert?"
+          echo "=== Unsere Netzconfig (muss existieren): /etc/systemd/network/89-pinokio.network"
+          cat "$MNT/etc/systemd/network/89-pinokio.network" 2>&1 || echo "FEHLT!"
+          echo
+          echo "--- networkd enabled?"
+          ls -l "$MNT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>&1 || true
+          echo
+          echo "=== Ist cloud-init ueberhaupt installiert? (sollte disabled sein)"
           ls -la "$MNT/usr/bin/cloud-init" 2>&1 || true
           echo
           echo "=== /etc/cloud Verzeichnis"
@@ -769,12 +872,14 @@ except Exception:
     if [ -z "$VM_IP" ]; then
       msg_warn "Konnte die IP-Adresse auch mit aktiver Diagnose nicht ermitteln."
       if [ "${DIAG_NO_TRAFFIC:-0}" = "1" ]; then
-        msg_warn "Nächster Schritt: Proxmox-WebUI -> VM -> Console öffnen und die Boot-/Cloud-Init-"
-        msg_warn "Ausgabe prüfen. Alternativ anderes OS testen: OS_IMAGE=ubuntu2404 beim Neuerstellen."
+        msg_warn "Nächster Schritt: 'qm terminal ${VMID}' öffnen und prüfen:"
+        msg_warn "  networkctl status; ip a; cat /etc/systemd/network/89-pinokio.network"
+        msg_warn "Alternativ anderes OS testen: OS_IMAGE=ubuntu2404 beim Neuerstellen."
       elif [ "${DIAG_DHCP_ONLY:-0}" = "1" ]; then
         msg_warn "Nächster Schritt: VM neu erstellen MIT statischer IP, z.B.:"
         msg_warn "  IPCONFIG=\"ip=<freie-IP>/24,gw=<Gateway>\" bash -c \"\$(curl -fsSL <create-vm-url>)\""
       fi
+    fi
     fi
   fi
 fi

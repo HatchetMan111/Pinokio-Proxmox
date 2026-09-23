@@ -36,10 +36,11 @@ die VM keinen Monitor, keine Tastatur und keine grafische Sitzung braucht.
   wie bei den Proxmox Community-Scripts) – Maschinentyp, OS, Ressourcen, Storage,
   Bridge, IP-Konfiguration und optional GPU lassen sich dort auswählen, ohne
   Umgebungsvariablen von Hand zu setzen
-- Findet die IP auch dann, wenn Gast-Agent/ARP nichts liefern: aktive Diagnose per
-  `tcpdump`-Mithören am Tap-Gerät/an der Bridge, Ping-Sweep des Subnetzes, und als
+- Findet die IP auch ohne Gast-Agent (der ist in Cloud-Images ab Werk nicht drin):
+  aktive Diagnose per ARP + Bridge-FDB + `tcpdump`-Mithören am Tap-Gerät/an der Bridge,
+  Ping-Sweep des Subnetzes, statische `IPCONFIG` wird per Ping/SSH verifiziert, und als
   letzte Eskalationsstufe eine Tiefendiagnose (Disk read-only mounten, echte
-  Cloud-Init-Logs des Gastes auslesen und anzeigen)
+  Gast-Netzconfig `/etc/systemd/network/89-pinokio.network` + Logs auslesen)
 - Optional: kann eine GPU direkt bei der Erstellung durchreichen (`PCI_HOSTPCI=...`)
 
 `install.sh`:
@@ -85,6 +86,10 @@ Auf dem Proxmox-**Host** per SSH einloggen und als root ausführen:
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/create-vm.sh)"
 ```
+
+> Wichtig: unbedingt `bash -c "$(curl …)"` nutzen, **nicht** `curl … | bash` – nur so
+> hat der whiptail-Auswahl-Assistent ein Terminal. Log läuft mit unter
+> `/var/log/pinokio-create-vm-<VMID>.log`.
 
 Das erstellt VM, Betriebssystem und Pinokio-Installation komplett automatisch und
 **wartet am Ende, bis der Pinokio-Server unter `http://<VM-IP>:42000` erreichbar
@@ -327,10 +332,11 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Pr
   betroffen.
 - VM bekommt beim ersten Boot keine IP: `create-vm.sh` eskaliert das inzwischen
   automatisch selbst – nach `IP_WAIT_TIMEOUT` (Standard 10 Min.) startet es aktive
-  Diagnose (lauscht per `tcpdump` am Tap-Gerät/an der Bridge, macht einen
-  Ping-Sweep) und zeigt am Ende bei Bedarf sogar die echten Cloud-Init-Logs aus dem
-  Gast an (Disk wird dafür kurz read-only gemountet). Alternativ manuell: `qm
-  terminal <VMID>` (Login: `root`, Passwort steht in der Skript-Ausgabe unter
+  Diagnose (ARP + Bridge-FDB, `tcpdump` am Tap-Gerät/an der Bridge, Ping-Sweep) und
+  zeigt am Ende bei Bedarf die Gast-Netzconfig (`/etc/systemd/network/89-pinokio.network`,
+  per read-only Disk-Mount) an. Volles Log: `/var/log/pinokio-create-vm-<VMID>.log`.
+  In der VM selbst hilft: `networkctl status; ip a; cat /etc/systemd/network/89-pinokio.network`.
+  Alternativ manuell: `qm terminal <VMID>` (Login: `root`, Passwort steht in der Skript-Ausgabe unter
   "Konsolen-PW" – funktioniert nur lokal über die Konsole, nicht per SSH)
 - Bei wiederholten, unerklärlichen Fehlern im Gast (fehlende Pakete, kein Netzwerk
   trotz allem): das gecachte Cloud-Image könnte beschädigt sein. Mit
