@@ -587,12 +587,18 @@ EOF
     systemctl --root="$mnt" enable systemd-networkd.service >/dev/null 2>&1 || true
   fi
   mkdir -p "$mnt/etc/systemd/system/multi-user.target.wants"
-  for _unit_src in "$mnt/usr/lib/systemd/system/systemd-networkd.service" "$mnt/lib/systemd/system/systemd-networkd.service"; do
-    if [ -f "$_unit_src" ]; then
-      ln -sf "$_unit_src" "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
-      break
-    fi
-  done
+  # WICHTIG: Target muss der GAST-absolute Pfad sein (/usr/lib/... bzw. /lib/...),
+  # NICHT "$mnt/..." (Host-Mount-Pfad) – sonst hängt der Symlink im Gast in der Luft
+  # und systemd-networkd startet nie (v6-Bug: genau das ist passiert).
+  if [ -f "$mnt/usr/lib/systemd/system/systemd-networkd.service" ]; then
+    ln -sf /usr/lib/systemd/system/systemd-networkd.service \
+      "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
+  elif [ -f "$mnt/lib/systemd/system/systemd-networkd.service" ]; then
+    ln -sf /lib/systemd/system/systemd-networkd.service \
+      "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
+  else
+    msg_warn "systemd-networkd.service im Image nicht gefunden – Netzwerk könnte tot sein."
+  fi
   # Alte cloud-init-Netzreste entfernen, damit kein Renderer dazwischenfunkt.
   rm -f "$mnt/etc/network/interfaces.d/50-cloud-init.cfg" 2>/dev/null || true
 
@@ -602,6 +608,7 @@ EOF
   touch "$mnt/etc/cloud/cloud-init.disabled"
 
   # 6) Hinweis auf Konsole: IP nach Login sichtbar machen
+  mkdir -p "$mnt/etc/issue.d" 2>/dev/null || true
   printf '\nPinokio-VM bereit. Netzwerk: %s (systemd-networkd)\n' "${PINOKIO_STATIC_IP:-DHCP}" > "$mnt/etc/issue.d/pinokio.issue" 2>/dev/null || true
 
   sync
