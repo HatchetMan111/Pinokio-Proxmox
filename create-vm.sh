@@ -515,22 +515,40 @@ except Exception:
   [ -z "$vol_fmt" ] && vol_fmt="raw"
 
   qemu-nbd -c "$nbd_dev" -f "$vol_fmt" "$vol_dev" >/dev/null || { msg_err "qemu-nbd Verbinden fehlgeschlagen (Format: ${vol_fmt}, Device: ${vol_dev}, NBD: ${nbd_dev})"; return 1; }
-  sleep 1
-  partprobe "$nbd_dev" >/dev/null 2>&1 || true
+  # Der Kernel-Partitions-Scan an NBD hinkt manchmal hinterher (Race): bis zu 15s
+  # warten, bis Partitionsgeräte sichtbar sind, statt nach fix 1s zu mounten.
+  msg_info "Warte auf Partitionsgeräte an ${nbd_dev}..."
+  for _w in $(seq 1 15); do
+    partprobe "$nbd_dev" >/dev/null 2>&1 || true
+    if ls "${nbd_dev}"p* >/dev/null 2>&1; then break; fi
+    sleep 1
+  done
 
   mkdir -p "$mnt"
   part=""
-  for p in "${nbd_dev}p1" "${nbd_dev}p2" "${nbd_dev}p3" "$nbd_dev"; do
-    if [ -b "$p" ] && blkid -o value -s TYPE "$p" 2>/dev/null | grep -qE '^ext[234]$'; then
+  # Alle Partitionen dynamisch aufzählen statt starrer p1/p2/p3-Liste (je nach Image
+  # liegt root anders). Whole-Disk als letzter Fallback.
+  _parts="$(ls "${nbd_dev}"p* 2>/dev/null || true)"
+  # shellcheck disable=SC2086
+  for p in $_parts "$nbd_dev"; do
+    [ -b "$p" ] || continue
+    _fstype="$(blkid -o value -s TYPE "$p" 2>/dev/null || true)"
+    msg_info "Prüfe ${p} (fstype: ${_fstype:-unbekannt})..."
+    if echo "${_fstype:-}" | grep -qE '^ext[234]$'; then
       if mount "$p" "$mnt" 2>/dev/null; then part="$p"; break; fi
+      msg_warn "Mount von ${p} fehlgeschlagen, versuche nächste Partition..."
     fi
   done
   if [ -z "$part" ]; then
-    msg_err "Konnte keine Root-Partition im Image mounten"
+    msg_err "Konnte keine Root-Partition im Image mounten. Diagnose:"
+    lsblk "$nbd_dev" 2>&1 || true
+    blkid "${nbd_dev}"* 2>&1 || true
+    dmesg 2>/dev/null | tail -20 || true
     umount "$mnt" 2>/dev/null || true
     qemu-nbd -d "$nbd_dev" >/dev/null 2>&1 || true
     return 1
   fi
+  msg_ok "Root-Partition gemountet: ${part}"
 
   # 1) Root-Passwort direkt setzen (das aus der Zusammenfassung, später per 'passwd' änderbar)
   echo "root:${CONSOLE_PASSWORD}" | chpasswd --root "$mnt" \
