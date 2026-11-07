@@ -374,7 +374,7 @@ if [ -f "$IMG_PATH" ]; then
   msg_info "Cloud-Image bereits im Cache, überspringe Download (${IMG_PATH})."
 else
   msg_info "Lade Cloud-Image herunter (${OS_IMAGE})..."
-  curl -fL --progress-bar -o "$IMG_PATH" "$IMG_URL"
+  curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$IMG_PATH" "$IMG_URL"
   msg_ok "Download abgeschlossen."
 fi
 
@@ -383,7 +383,7 @@ fi
 if ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
   msg_warn "qemu-img check meldet Fehler im Image (${IMG_PATH}) - lösche und lade neu..."
   rm -f "$IMG_PATH"
-  curl -fL --progress-bar -o "$IMG_PATH" "$IMG_URL"
+  curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$IMG_PATH" "$IMG_URL"
   if ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
     msg_err "Auch das frisch heruntergeladene Image ist fehlerhaft. Abbruch."
     exit 1
@@ -421,9 +421,9 @@ verify_image_checksum() {
 }
 
 if ! verify_image_checksum; then
-  msg_warn "Lösche das fehlerhafte Image und lade neu herunter..."
-  rm -f "$IMG_PATH"
-  curl -fL --progress-bar -o "$IMG_PATH" "$IMG_URL"
+    msg_warn "Lösche das fehlerhafte Image und lade neu herunter..."
+    rm -f "$IMG_PATH"
+    curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$IMG_PATH" "$IMG_URL"
   if ! verify_image_checksum || ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
     msg_err "Auch nach erneutem Download ist das Image fehlerhaft. Abbruch."
     exit 1
@@ -966,7 +966,7 @@ if [ -n "$VM_IP" ] && [ "$WAIT_FOR_PINOKIO" = "yes" ]; then
 
   # 8b: install.sh herunterladen und in der VM ausführen (Output wird live gestreamt)
   TMP_INSTALL="/tmp/pinokio-install-$$.sh"
-  curl -fsSL "${INSTALL_SCRIPT_URL}" -o "${TMP_INSTALL}"
+  curl -fsSL --retry 3 --retry-delay 2 "${INSTALL_SCRIPT_URL}" -o "${TMP_INSTALL}"
   msg_info "Führe install.sh in der VM aus (dauert einige Minuten, Output live)..."
   ssh -i "${SSH_PUBKEY_FILE%.pub}" \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
