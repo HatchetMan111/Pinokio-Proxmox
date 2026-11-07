@@ -43,6 +43,13 @@ err()    { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 die()    { err "$1"; exit 1; }
 header() { echo -e "\n${C_STEP}${C_BOLD}━━━ $1 ━━━${C_RESET}"; }
 
+# ── Interaktivität (TTY auf stdin UND stdout) ────────────────────────────────
+# Nur dann sind read/Assistenten erlaubt. Per Pipe (curl | bash) oder in CI
+# gibt es kein TTY -> niemals interaktiv fragen, nur klare Textanleitungen.
+is_interactive() {
+  [ -t 0 ] && [ -t 1 ]
+}
+
 # ── Defaults ────────────────────────────────────────────────────────────────
 PINOKIO_USER="pinokio"
 PINOKIO_HOME="/home/${PINOKIO_USER}"
@@ -60,7 +67,7 @@ TMP_DEB=""
 TMP_TAG_FILE=""
 TMP_CREATE_VM=""
 
-SCRIPT_BUILD="2026-11-07-v7"
+SCRIPT_BUILD="2026-11-07-v8"
 
 # ── Cleanup (kein halber Zustand: Teildownloads werden entfernt) ────────────
 cleanup() {
@@ -166,7 +173,7 @@ handle_proxmox_host() {
 
   # Sauberer TTY-Fallback: nur interaktiv nachfragen; per Pipe (curl | bash)
   # niemals ohne Zustimmung eine VM anlegen.
-  if [ -t 0 ] && [ -t 1 ]; then
+  if is_interactive; then
     local answer=""
     echo
     # read kann bei EOF/Abbruch fehlschlagen -> nicht set -e überlassen
@@ -284,6 +291,94 @@ enable_debian_nonfree_components() {
 # Pakete, die fehlen können (architektur-/distrospezifisch), toleriert installieren
 apt_try_install() {
   apt-get install -y -qq "$@" >/dev/null 2>&1
+}
+
+# ── Electron-Laufzeit-Bibliotheken ───────────────────────────────────────────
+# Die Pinokio-.deb deklariert ihre Electron-Abhängigkeiten nicht selbst
+# (Live-Bug auf Debian 12: pinokio-bin crashte mit Exit 127, weil
+# libasound.so.2 fehlte). Debian-Cloud-Images sind zu minimal - deshalb hier
+# explizit vorab installieren. Namensvarianten: Ubuntu 24.04 (noble) nennt
+# mehrere dieser Bibliotheken mit t64-Suffix (libasound2t64 usw.) - ermittelt
+# wird automatisch, was die jeweilige Distribution tatsächlich anbietet.
+ELECTRON_RUNTIME_LIBS="libasound2 libgtk-3-0 libnss3 libxss1 libxtst6 libgbm1 \
+libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libatk1.0-0 \
+libatk-bridge2.0-0 libcups2 libpango-1.0-0 libcairo2 libx11-xcb1 \
+libglib2.0-0 libdbus-1-3 libx11-6 libxcb1 libxext6 libxrender1 libxi6"
+
+install_electron_runtime_libs() {
+  header "Electron-Laufzeit-Bibliotheken"
+  local unavailable="" l
+  for l in $ELECTRON_RUNTIME_LIBS; do
+    if dpkg -s "$l" >/dev/null 2>&1; then
+      continue
+    fi
+    if apt-cache show "$l" >/dev/null 2>&1; then
+      apt_try_install "$l" || true
+    elif apt-cache show "${l}t64" >/dev/null 2>&1; then
+      apt_try_install "${l}t64" || true
+    else
+      unavailable+=" $l"
+    fi
+  done
+  if [ -n "$unavailable" ]; then
+    warn "In dieser Distribution nicht auffindbar (übersprungen):${unavailable}"
+  fi
+  ok "Electron-Laufzeit-Bibliotheken sichergestellt (fehlende Pakete zeigt der ldd-Check nach der Installation konkret auf)."
+  return 0
+}
+
+# ── QEMU-Gast-Agent (nur in KVM/QEMU-VMs) ────────────────────────────────────
+# Der Gast-Agent erlaubt dem Proxmox-Host, die VM-IP sauber auszulesen
+# (qm guest cmd <vmid> network-get-interfaces). Cloud-Images bringen ihn
+# nicht mit - ohne ihn läuft die IP-Erkennung in create-vm.sh nur über
+# ARP/Sniffing. In Nicht-KVM-Umgebungen wird er bewusst übersprungen.
+install_guest_agent() {
+  local virt=""
+  virt="$(systemd-detect-virt 2>/dev/null || true)"
+  case "$virt" in
+    kvm|qemu)
+      info "KVM/QEMU-VM erkannt - installiere qemu-guest-agent (hilft der IP-Erkennung auf dem Host)..."
+      if apt_try_install qemu-guest-agent; then
+        systemctl enable qemu-guest-agent.service >/dev/null 2>&1 || true
+        ok "qemu-guest-agent installiert und aktiviert."
+      else
+        warn "qemu-guest-agent konnte nicht installiert werden (optional - überspringe)."
+      fi
+      ;;
+    *)
+      info "Keine KVM/QEMU-VM (virt=${virt:-unbekannt}) - qemu-guest-agent wird übersprungen."
+      ;;
+  esac
+  return 0
+}
+
+# Verifiziert nach der .deb-Installation, dass alle Shared Libraries des
+# Pinokio-Binaries auflösbar sind. Schlägt der Dienst sonst erst im
+# Healthcheck mit Exit 127 fehl ("error while loading shared libraries") -
+# hier lieber mit den konkreten Bibliotheksnamen abbrechen (das Skript ist
+# idempotent: Paket nachziehen, erneut ausführen).
+verify_pinokio_binary_libs() {
+  local bins="$1" b out missing=""
+  for b in $bins; do
+    [ -x "$b" ] || continue
+    out="$(ldd "$b" 2>/dev/null || true)"
+    if echo "$out" | grep -q 'not found'; then
+      missing+="
+
+  ${b}:
+$(echo "$out" | grep 'not found' | sed 's/^/    /')"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    die "Pinokio-Binary hat nicht auflösbare Bibliotheken (würde mit Exit 127 crashen):${missing}
+
+Fehlende Pakete nachinstallieren, z.B.:
+  apt-get install -y libasound2          # Debian; Ubuntu 24.04: libasound2t64
+  (weitere typische Electron-Abhängigkeiten: libgtk-3-0, libnss3, libxtst6, libgbm1)
+Danach dieses Skript erneut ausführen - es ist idempotent."
+  fi
+  ok "Alle Bibliotheken des Pinokio-Binaries sind auflösbar (ldd-Check)."
+  return 0
 }
 
 detect_and_install_gpu_drivers() {
@@ -455,6 +550,11 @@ Prüfen: existiert das Asset '${DEB_NAME}' im Release ${TAG}?
 (getestet: /opt/Pinokio/pinokio, /usr/bin/pinokio, /usr/local/bin/pinokio)."
   fi
   ok "Pinokio ${VERSION} installiert (${PINOKIO_BIN})."
+
+  # ldd-Gate: schlägt hier eine Library fehl, würde der Dienst später mit
+  # Exit 127 crashen (Live-Bug Debian 12: libasound.so.2 fehlte). Besser
+  # hier mit konkreten Namen abbrechen als im Healthcheck zu scheitern.
+  verify_pinokio_binary_libs "/opt/Pinokio/pinokio-bin ${PINOKIO_BIN}"
 }
 
 # ── Pinokio vorkonfigurieren (headless, ohne GUI-Ersteinrichtung) ───────────
@@ -530,6 +630,13 @@ User=${PINOKIO_USER}
 Group=${PINOKIO_USER}
 Environment=HOME=${PINOKIO_HOME}
 Environment=DISPLAY=${DISPLAY_NUM}
+# HTTPS erzwingend abschalten: Pinokio 3.x bietet einen "Secure Localhost"-
+# Modus, dessen Einrichtung ein Systempasswort per sudo verlangt. Unser
+# Dienstbenutzer hat bewusst kein Passwort - der Dialog wäre unbefriedigbar.
+# pinokiod liest PINOKIO_HTTPS_ACTIVE zuerst aus der Prozess-Umgebung (peer.js,
+# resolveFlag), das Unit-Flag gewinnt also garantiert. Web-UI bleibt via HTTP
+# auf Port 42000 erreichbar (vorgesehener Weg, siehe README/Sicherheitshinweis).
+Environment=PINOKIO_HTTPS_ACTIVE=0
 ExecStart=${PINOKIO_BIN} --no-sandbox
 Restart=on-failure
 RestartSec=10
@@ -566,6 +673,17 @@ wait_for_pinokio() {
     fi
     if ! systemctl is-active --quiet pinokio.service; then
       err "Dienst 'pinokio' läuft nicht mehr. Logs: journalctl -u pinokio -e"
+      # Exit 127 heißt fast immer: fehlende Shared Library - direkt aus dem
+      # Journal holen und benennen, statt es den Nutzer herausfinden zu lassen.
+      local lib_miss=""
+      lib_miss="$(journalctl -u pinokio.service -n 50 --no-pager 2>/dev/null \
+        | grep -oE 'error while loading shared libraries: [^:]+' \
+        | tail -1 | sed -E 's/^error while loading shared libraries: //')" || lib_miss=""
+      if [ -n "$lib_miss" ]; then
+        err "Grund: fehlende Bibliothek '${lib_miss}' (Exit 127). Nachinstallieren, z.B.:"
+        err "  apt-get install -y libasound2   # Debian; Ubuntu 24.04: libasound2t64"
+        err "Danach: systemctl restart pinokio pinokio-xvfb"
+      fi
       break
     fi
     sleep 5
@@ -641,6 +759,11 @@ print_summary() {
     warn "GPU-Treiberinstallation wurde übersprungen – siehe Hinweise oben / README.md."
     echo
   fi
+  info "Falls die Web-UI nach dem HTTPS-Zertifikat fragt (\"Enter the system password\"): einfach abbrechen."
+  info "  Das ist Pinokios optionaler Secure-Localhost-Modus - er verlangt ein Systempasswort,"
+  info "  das der Dienstbenutzer 'pinokio' bewusst nicht hat. Der Installer schaltet den Modus"
+  info "  per PINOKIO_HTTPS_ACTIVE=0 im systemd-Unit ab; HTTP auf Port 42000 ist der vorgesehene Weg."
+  echo
   info "Falls die Web-UI doch einen Einrichtungsdialog zeigt (normalerweise nicht nötig):"
   echo "    1) Auf deinem PC: ssh -L 5900:localhost:5900 root@${VM_IP:-<VM-IP>}"
   echo "    2) In der VM:     systemctl start pinokio-vnc"
@@ -737,6 +860,8 @@ do_install() {
     header "Pinokio aktualisieren (idempotenter Lauf)"
   fi
   install_base_packages
+  install_electron_runtime_libs
+  install_guest_agent
   detect_and_install_gpu_drivers
   create_service_user
   install_pinokio_package
