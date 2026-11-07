@@ -20,6 +20,21 @@
 #
 set -euo pipefail
 
+# ==== TTY-STATUS: BEGIN (auch von den Tests gesourct) ====
+# Die TTY-Erkennung muss VOR jeglicher Ausgabenumleitung passieren: weiter
+# unten leitet 'exec > >(tee ...)' stdout in die Log-Pipe um - danach wäre
+# [ -t 1 ] dauerhaft false, obwohl ein echtes Terminal existiert. HAVE_TTY
+# steuert, ob interaktive Befehle erlaubt sind (whiptail-Assistent, qm
+# terminal). Ohne TTY: niemals interaktive Befehle versuchen - nur klare
+# Textanleitungen ausgeben (Live-Bug: 'qm terminal' ohne TTY crashte mit
+# socat "Inappropriate ioctl for device").
+if [ -t 0 ] && [ -t 1 ]; then
+  HAVE_TTY=1
+else
+  HAVE_TTY=0
+fi
+# ==== TTY-STATUS: ENDE ====
+
 # ----------------------------------------------------------------------------
 # Ausgabe-Hilfsfunktionen + Fehler-Transparenz
 # ----------------------------------------------------------------------------
@@ -29,7 +44,7 @@ msg_ok()   { echo -e "${C_OK}✔${C_RESET} $*"; }
 msg_warn() { echo -e "${C_WARN}⚠${C_RESET} $*"; }
 msg_err()  { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 
-SCRIPT_BUILD="2026-09-23-v6"
+SCRIPT_BUILD="2026-11-07-v7"
 echo -e "${C_STEP}Pinokio-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
 echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
 echo -e "${C_STEP}Log: /var/log/pinokio-create-vm-<VMID>.log (wird nach Feststehen der VMID angelegt)${C_RESET}"
@@ -50,30 +65,46 @@ on_err() {
 }
 trap on_err ERR
 
-# ----------------------------------------------------------------------------
+# ==== IP-ERMITTLUNG: BEGIN (auch von den Tests gesourct) ====
+# ============================================================================
 # Aktive Netzwerk-Diagnose: IP der VM auch dann finden, wenn Gast-Agent fehlt
-# und die ARP-Tabelle leer bleibt (z.B. weil cloud-init/DHCP in der VM hängt).
-# ----------------------------------------------------------------------------
-# Lauscht auf dem Bridge-Interface nach Paketen der VM und extrahiert deren
-# Quell-IP (aus ARP-Sender-Adressen oder IP-Paket-Headern).
+# und die ARP-Tabelle leer bleibt. Bewusst subnetz-unabhängig: Es gibt keine
+# Filter oder Annahmen auf 192.168.* o.ä. - das VM-Netz kann jedes Präfix
+# haben (Live-Fall: 10.120.1.x). Mehrstufig, siehe detect_vm_ip():
+#   Stufe 1: Passiv pollen (Gast-Agent, ARP, Bridge-FDB)
+#   Stufe 2: statische Wunsch-IP (ipconfig0) per Ping + Port 22 verifizieren
+#   Stufe 3: aktive Runden - Ping-Sweep, DHCP-yiaddr-Sniff, tcpdump am Tap/an
+#            der Bridge, danach erneut ARP
+#   Stufe 4: Tiefendiagnose - Gast-Disk read-only mounten, Logs auslesen
+# ============================================================================
 # Strikte IPv4-Prüfung (4 Oktette, je 0-255). Schützt davor, trunkierte
-# Sniff-Treffer wie '192.168.178' in den SSH-Wait zu übernehmen (kostet sonst
-# 5 Minuten Timeout auf einer Adresse, die nie antworten kann).
+# Sniff-/ARP-Treffer wie '192.168.178' in den SSH-Wait zu übernehmen (kostet
+# sonst 5 Minuten Timeout auf einer Adresse, die nie antworten kann).
 valid_ipv4() {
   echo "$1" | awk -F. 'NF==4 {for(i=1;i<=4;i++){if($i !~ /^[0-9]+$/ || $i<0 || $i>255) exit 1} exit 0} {exit 1}' >/dev/null 2>&1
 }
 
 sniff_vm_ip() {
-  local mac="$1" bridge="$2" secs="$3" raw="" ip=""
+  local mac="$1" dev="$2" secs="$3" raw="" ip=""
+  SNIFF_PACKETS=0
+  SNIFF_RESULT=""
   command -v tcpdump >/dev/null 2>&1 || return 0
-  raw="$(timeout "$secs" tcpdump -i "$bridge" -n -l -c 200 "ether src ${mac}" 2>/dev/null || true)"
+  raw="$(timeout "$secs" tcpdump -i "$dev" -n -l -c 200 "ether src ${mac}" 2>/dev/null || true)"
   SNIFF_PACKETS="$(echo "$raw" | grep -c . || true)"
   # 1) ARP-Sender-IP: 'who-has X tell Y' -> Y ist die IP der VM
   ip="$(echo "$raw" | grep -oE 'tell [0-9]+(\.[0-9]+){3}' | awk '{print $2}' \
       | grep -vE '^(0\.|127\.|169\.254\.)' | head -1 || true)"
+  # 1a) ARP-Reply der VM (Gratuitous ARP direkt nach der DHCP-Zuteilung):
+  #     'ARP Reply <ip> is-at <mac>'
+  if [ -z "$ip" ]; then
+    ip="$(echo "$raw" | grep -oiE 'reply [0-9]+(\.[0-9]+){3}' | awk '{print $2}' \
+        | grep -vE '^(0\.|127\.|255\.|169\.254\.)' | head -1 || true)"
+  fi
   # 2) Quell-IP aus IP-Paketen MIT Port (tcpdump: 'IP A.B.C.D.port > ...') –
   #    nur die Port-Gruppe entfernen. (Alter Code hat hier auch bei portlosen
   #    Zeilen das letzte Oktett abgeschnitten -> '192.168.178'.)
+  #    Sicher, weil der Capture-Filter 'ether src <mac>' nur eigenes Traffic
+  #    der VM enthält - die Quell-IP gehört also der VM.
   if [ -z "$ip" ]; then
     ip="$(echo "$raw" | grep -oE 'IP ([0-9]+\.){3}[0-9]+\.[0-9]+' \
         | sed -E 's/^IP //; s/\.[0-9]+$//' \
@@ -87,10 +118,38 @@ sniff_vm_ip() {
   fi
   # 4) Sicherheitsnetz: nur gültige IPv4 weitergeben.
   if [ -n "$ip" ] && ! valid_ipv4 "$ip"; then
-    msg_warn "Sniff-Treffer '${ip}' verworfen (ungültige IP)."
+    # >&2: die Warnung darf nicht unbeabsichtigt im Skript-Output landen.
+    msg_warn "Sniff-Treffer '${ip}' verworfen (ungültige IP)." >&2
     ip=""
   fi
-  [ -n "$ip" ] && echo "$ip"
+  # Ergebnis als GLOBAL zurückgeben (nicht per stdout): Der Aufrufer ruft
+  # diese Funktion direkt (ohne $( ... )) auf - nur so überleben auch die
+  # Zähler SNIFF_PACKETS/SNIFF_RESULT den Subshell-Rand. (Alter Code verlor
+  # SNIFF_PACKETS genau dadurch - die "Gast sendet Traffic"-Diagnose griff nie.)
+  SNIFF_RESULT="$ip"
+  return 0
+}
+
+# Lauscht auf DHCP-Verkehr der VM (beide Richtungen) und liest aus den
+# OFFER/ACK-Paketen des Servers die zugewiesene Adresse ('your address' bzw.
+# 'yiaddr'). Funktioniert subnetz-unabhängig und auch dann, wenn der Host
+# selbst keine IPv4 an der Bridge hat (dann lernt er weder ARP-Einträge noch
+# kann er pingen - das Mithören am Tap ist dort der einzige Host-seitige Weg).
+# Rückgabe wie sniff_vm_ip: SNIFF_RESULT (IP oder leer) + DHCP_PACKETS als Globals.
+sniff_dhcp_offer() {
+  local mac="$1" dev="$2" secs="$3" raw="" ip=""
+  DHCP_PACKETS=0
+  SNIFF_RESULT=""
+  command -v tcpdump >/dev/null 2>&1 || return 0
+  raw="$(timeout "$secs" tcpdump -i "$dev" -n -l -v -c 40 \
+      "ether host ${mac} and (udp port 67 or udp port 68)" 2>/dev/null || true)"
+  DHCP_PACKETS="$(echo "$raw" | grep -c . || true)"
+  ip="$(echo "$raw" | grep -oiE '(your address|yiaddr)[ :=]+[0-9]+(\.[0-9]+){3}' \
+      | grep -oE '[0-9]+(\.[0-9]+){3}' \
+      | grep -vE '^(0\.|127\.|169\.254\.)' | head -1 || true)"
+  if [ -n "$ip" ] && valid_ipv4 "$ip"; then
+    SNIFF_RESULT="$ip"
+  fi
   return 0
 }
 
@@ -110,6 +169,415 @@ ping_sweep() {
   wait 2>/dev/null || true
   return 0
 }
+
+# Eine einzige Gast-Agent-Abfrage: gibt die erste globale IPv4 der VM aus
+# (oder nichts). Der Agent liefert nach dem Boot erst nach einigen Sekunden
+# Daten - daher wird diese Abfrage in Stufe 1 wiederholt gepollt. Der Filter
+# nimmt nur echte globale IPv4-Adressen (kein Loopback, kein Link-Local/APIPA).
+agent_query_ip() {
+  local vmid="$1" json="" ip=""
+  json="$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null || true)"
+  [ -n "$json" ] || return 0
+  ip="$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for iface in data:
+    if iface.get("name") == "lo":
+        continue
+    for addr in iface.get("ip-addresses", []):
+        ipaddr = addr.get("ip-address", "") or ""
+        if addr.get("ip-address-type") != "ipv4":
+            continue
+        # global = weder Loopback noch Link-Local (APIPA) noch 0.0.0.0
+        if ipaddr.startswith("127.") or ipaddr.startswith("169.254.") or ipaddr.startswith("0."):
+            continue
+        print(ipaddr)
+        sys.exit(0)
+' 2>/dev/null || true)"
+  if [ -n "$ip" ] && valid_ipv4 "$ip"; then
+    printf '%s\n' "$ip"
+  fi
+  return 0
+}
+
+# ARP-Tabelle des Hosts nach der MAC der VM durchsuchen (nur gültige IPv4).
+arp_lookup() {
+  local mac="$1" ip=""
+  [ -n "$mac" ] || return 0
+  ip="$(ip neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1 || true)"
+  if [ -n "$ip" ] && valid_ipv4 "$ip"; then
+    printf '%s\n' "$ip"
+  fi
+  return 0
+}
+
+# Statische Kandidaten-IP aktiv verifizieren: nur übernehmen, wenn der
+# SSH-Port 22 antwortet (nie blind - sonst hängt der SSH-Wait 5 Minuten an
+# einer toten Adresse).
+try_static_ip() {
+  local cand="$1"
+  [ -n "$cand" ] || return 0
+  ping -c2 -W2 "$cand" >/dev/null 2>&1 || true
+  if timeout 3 bash -c "</dev/tcp/${cand}/22" 2>/dev/null; then
+    printf '%s\n' "$cand"
+  fi
+  return 0
+}
+
+# Stufe 3: aktive Runden. Jede Runde: Subnetz anpingen (füllt die ARP-Tabelle),
+# ARP prüfen, DHCP-yiaddr-Sniff am Tap, generischer Sniff am Tap und an der
+# Bridge, danach erneut ARP. Mehrere Runden mit Pause, weil der Gast sein DHCP
+# (besonders nach frischem Boot) zeitversetzt macht - ein einzelnes 20s-Fenster
+# Minuten nach dem Boot sah im Live-Lauf nichts, weil der Gast da schon wieder
+# funkstille hatte.
+active_discovery_rounds() {
+  local ip="" round_num=0 tap_dev="tap${VMID}i0"
+  DIAG_NO_TRAFFIC=0
+  DIAG_TAP_OK=0
+
+  # tcpdump nur nachinstallieren, wenn überhaupt gesnifft werden kann
+  if [ -n "$MAC" ] && ! command -v tcpdump >/dev/null 2>&1; then
+    msg_info "Installiere tcpdump für die Netzwerk-Diagnose..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcpdump >/dev/null 2>&1 || true
+  fi
+
+  # Ist der Tap-Geräte-Port der VM überhaupt an der Bridge angeschlossen?
+  if ip link show "$tap_dev" >/dev/null 2>&1; then
+    if ip link show "$tap_dev" | grep -q "master ${BRIDGE}"; then
+      msg_ok "${tap_dev} ist an ${BRIDGE} angeschlossen."
+    else
+      msg_warn "Diagnose: ${tap_dev} existiert, hängt aber NICHT an ${BRIDGE}! (master: $(ip link show "$tap_dev" | grep -oE 'master [^ ]+' || echo 'keine'))"
+    fi
+  else
+    msg_warn "Diagnose: Tap-Gerät ${tap_dev} existiert nicht - VM-NIC nicht verbunden?"
+  fi
+
+  if [ -z "$MAC" ]; then
+    msg_warn "Keine MAC der VM ermittelbar - Sniffing übersprungen, nur Ping-Sweep + ARP."
+  elif ! command -v tcpdump >/dev/null 2>&1; then
+    msg_warn "tcpdump nicht verfügbar - Sniffing übersprungen, nur Ping-Sweep + ARP."
+  fi
+
+  while [ "$round_num" -lt "$SNIFF_ROUNDS" ]; do
+    round_num=$((round_num + 1))
+    msg_info "Aktive Runde ${round_num}/${SNIFF_ROUNDS}: Ping-Sweep -> ARP -> Sniff..."
+
+    ping_sweep
+    ip="$(arp_lookup "$MAC")"
+    if [ -n "$ip" ]; then
+      VM_IP="$ip"
+      msg_ok "IP nach Ping-Sweep aus der ARP-Tabelle ermittelt: ${VM_IP}"
+      return 0
+    fi
+
+    if [ -n "$MAC" ] && command -v tcpdump >/dev/null 2>&1; then
+      # 0) Gezielt DHCP OFFER/ACK mitlesen (subnetz-unabhängig, liefert die
+      #    zugewiesene Adresse direkt aus dem Server-Verkehr zur VM)
+      if ip link show "$tap_dev" >/dev/null 2>&1; then
+        msg_info "Lausche ${SNIFF_DHCP_SECS}s an ${tap_dev} auf DHCP-OFFER/ACK..."
+        sniff_dhcp_offer "$MAC" "$tap_dev" "$SNIFF_DHCP_SECS"
+        ip="$SNIFF_RESULT"
+        if [ -n "$ip" ]; then
+          VM_IP="$ip"
+          msg_ok "IP aus dem DHCP-Verkehr ermittelt: ${VM_IP}"
+          return 0
+        fi
+        if [ "$DHCP_PACKETS" -gt 0 ]; then
+          msg_info "DHCP-Verkehr sichtbar (${DHCP_PACKETS} Pakete), aber kein 'your address' - der Server antwortet evtl. verzögert."
+        fi
+      fi
+      # 1) Direkt am Tap lauschen: zeigt Pakete, die der GAST selbst sendet
+      if ip link show "$tap_dev" >/dev/null 2>&1; then
+        msg_info "Lausche ${SNIFF_SECS}s direkt an ${tap_dev} (was sendet der Gast?)..."
+        sniff_vm_ip "$MAC" "$tap_dev" "$SNIFF_SECS"
+        ip="$SNIFF_RESULT"
+        if [ -n "$ip" ]; then
+          VM_IP="$ip"
+          msg_ok "IP aus dem Traffic des Gastes ermittelt: ${VM_IP}"
+          return 0
+        fi
+        if [ "$SNIFF_PACKETS" -eq 0 ]; then
+          DIAG_NO_TRAFFIC=1
+          msg_warn "Diagnose: Der Gast sendet NICHT EINMAL am Tap-Gerät (${tap_dev}) etwas."
+          msg_warn "=> Das Gast-Netzwerk ist vermutlich tot (networkd startet nicht / kein DHCP-Versuch)."
+        else
+          DIAG_TAP_OK=1
+          msg_info "Der Gast sendet Pakete am Tap (${SNIFF_PACKETS} gesehen) - prüfe Bridge-Weiterleitung..."
+        fi
+      fi
+      # 2) Fallback: an der Bridge lauschen
+      if [ "$DIAG_NO_TRAFFIC" != "1" ]; then
+        msg_info "Lausche ${SNIFF_SECS}s an ${BRIDGE}..."
+        sniff_vm_ip "$MAC" "$BRIDGE" "$SNIFF_SECS"
+        ip="$SNIFF_RESULT"
+        if [ -n "$ip" ]; then
+          VM_IP="$ip"
+          msg_ok "IP aus dem Netzwerk-Traffic ermittelt: ${VM_IP}"
+          return 0
+        fi
+        if [ "$SNIFF_PACKETS" -eq 0 ] && [ "$DIAG_TAP_OK" = "1" ]; then
+          msg_warn "Diagnose: Gast sendet am Tap, aber NICHTS kommt an ${BRIDGE} an -"
+          msg_warn "=> Bridge-Weiterleitung/Firewall blockt (pve-firewall status prüfen!)."
+        fi
+      fi
+    fi
+
+    # Nach dem Sniffen nochmals ARP prüfen (der Traffic füllt ggf. die Tabelle)
+    ip="$(arp_lookup "$MAC")"
+    if [ -n "$ip" ]; then
+      VM_IP="$ip"
+      msg_ok "IP aus der ARP-Tabelle ermittelt (nach Sniff): ${VM_IP}"
+      return 0
+    fi
+
+    if [ "$round_num" -lt "$SNIFF_ROUNDS" ]; then
+      msg_info "Pause ${SNIFF_PAUSE}s - der Gast könnte sein DHCP noch nachholen..."
+      sleep "$SNIFF_PAUSE"
+    fi
+  done
+  return 0
+}
+
+# Stufe 4: Tiefendiagnose - wenn der Gast komplett schweigt, seine Disk vom
+# Host aus (read-only) mounten und die Netzwerk-/Cloud-Init-Logs des Gastes
+# auslesen. Liefert die definitive Ursache, ohne Login/Netzwerk zu benötigen.
+run_deep_diagnosis() {
+  local deep_file="/tmp/pinokio-deepdiag-${VMID}.txt"
+  local mnt="/mnt/pinokio-diag"
+  msg_info "Tiefendiagnose: Stoppe VM, mounte Disk read-only, lese Gast-Logs..."
+
+  (
+    set +e
+    qm stop "$VMID" >/dev/null 2>&1
+    SCASI_LINE="$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/{print $2}' | head -1)"
+    VOL_SPEC="${SCASI_LINE%%,*}"
+    VOL_DEV="$(pvesm path "$VOL_SPEC" 2>/dev/null)"
+    [ -z "$VOL_DEV" ] && exit 1
+    modprobe nbd max_part=16 >/dev/null 2>&1
+    NBD_DEV="$(find_free_nbd)"
+    [ -z "$NBD_DEV" ] && exit 1
+    VOL_FMT="$(qemu-img info --output=json "$VOL_DEV" 2>/dev/null | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("format","raw"))
+except Exception:
+    print("raw")' 2>/dev/null)"
+    [ -z "$VOL_FMT" ] && VOL_FMT="raw"
+    qemu-nbd -c "$NBD_DEV" -f "$VOL_FMT" --read-only "$VOL_DEV" >/dev/null 2>&1
+    sleep 1
+    partprobe "$NBD_DEV" >/dev/null 2>&1
+    mkdir -p "$mnt"
+    ROOT_PART=""
+    for p in "${NBD_DEV}p1" "${NBD_DEV}p2" "${NBD_DEV}p15" "$NBD_DEV"; do
+      if [ -b "$p" ] && blkid -o value -s TYPE "$p" 2>/dev/null | grep -qE '^ext[234]$'; then
+        if mount -o ro "$p" "$mnt" 2>/dev/null; then ROOT_PART="$p"; break; fi
+      fi
+    done
+    {
+      echo "=== Root-Partition: ${ROOT_PART:-NICHT GEFUNDEN}"
+      echo
+      echo "=== Unsere Netzconfig (muss existieren): /etc/systemd/network/89-pinokio.network"
+      cat "$mnt/etc/systemd/network/89-pinokio.network" 2>&1 || echo "FEHLT!"
+      echo
+      echo "--- networkd enabled?"
+      ls -l "$mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>&1 || true
+      echo
+      echo "--- Gast-Agent first-boot Unit (muss existieren):"
+      ls -l "$mnt/etc/systemd/system/multi-user.target.wants/pinokio-install-guest-agent.service" 2>&1 || true
+      echo
+      echo "=== Ist cloud-init ueberhaupt installiert? (sollte disabled sein)"
+      ls -la "$mnt/usr/bin/cloud-init" 2>&1 || true
+      echo
+      echo "=== /etc/cloud Verzeichnis"
+      ls "$mnt/etc/cloud/" 2>&1 || true
+      ls "$mnt/etc/cloud/cloud.cfg.d/" 2>&1 || true
+      echo
+      echo "=== Netzwerk-Konfiguration im Gast"
+      echo "--- /etc/network/interfaces:"
+      cat "$mnt/etc/network/interfaces" 2>&1 || true
+      echo "--- /etc/network/interfaces.d/:"
+      ls "$mnt/etc/network/interfaces.d/" 2>&1 || true
+      cat "$mnt/etc/network/interfaces.d/"* 2>/dev/null || true
+      echo "--- /etc/netplan/:"
+      ls "$mnt/etc/netplan/" 2>&1 || true
+      cat "$mnt/etc/netplan/"* 2>/dev/null || true
+      echo
+      echo "=== /var/log/cloud-init.log (letzte 80 Zeilen)"
+      tail -80 "$mnt/var/log/cloud-init.log" 2>&1 || true
+      echo
+      echo "=== /var/log/cloud-init-output.log (letzte 50 Zeilen)"
+      tail -50 "$mnt/var/log/cloud-init-output.log" 2>&1 || true
+      echo
+      echo "=== /var/lib/cloud Struktur"
+      find "$mnt/var/lib/cloud" -maxdepth 3 2>&1 | head -40 || true
+    } > "$deep_file" 2>&1
+    umount "$mnt" >/dev/null 2>&1
+    qemu-nbd -d "$NBD_DEV" >/dev/null 2>&1
+  ) || true
+
+  qm start "$VMID" >/dev/null 2>&1 || true
+
+  if [ -s "$deep_file" ]; then
+    msg_ok "Gast-Logs extrahiert (${deep_file}):"
+    echo -e "${C_STEP}──────────────── BEGINN GAST-DIAGNOSE ────────────────${C_RESET}"
+    cat "$deep_file"
+    echo -e "${C_STEP}───────────────── ENDE GAST-DIAGNOSE ─────────────────${C_RESET}"
+    msg_warn "Bitte diesen Abschnitt vollständig kopieren und beim Issue melden."
+  else
+    msg_warn "Tiefendiagnose fehlgeschlagen (nbd/mount nicht möglich?). Log manuell prüfen."
+  fi
+  return 0
+}
+
+# Gezielte Checkliste für den manuellen Fehlerfall (statt generischem
+# "Konsole öffnen"). Deckt die Live-Fall-Fragen ab: richtige Bridge?,
+# Bridge-Subnetz vs. VM-Subnetz?, DHCP sichtbar?, Gast-Agent?, Lease?
+print_ip_failure_checklist() {
+  echo
+  msg_info "Checkliste zur manuellen Fehlersuche (in dieser Reihenfolge):"
+  echo "  1) Hängt die VM an der richtigen Bridge?"
+  echo "       qm config ${VMID} | grep net0        # BRIDGE=${BRIDGE} erwartet"
+  echo "  2) Hat ${BRIDGE} eine IPv4 im VM-Subnetz?"
+  echo "       ip -4 addr show dev ${BRIDGE}"
+  echo "     Ohne IPv4 an der Bridge lernt der Host keine ARP-Einträge und der"
+  echo "     Ping-Sweep läuft leer - dann sind Tap-Sniff (oben automatisch gelaufen)"
+  echo "     und der Gast-Agent die einzigen Host-seitigen Wege."
+  echo "  3) Sieht der Host DHCP-Verkehr der VM? (30s mitlaufen lassen, Strg+C beendet)"
+  echo "       tcpdump -ni ${BRIDGE} -v 'udp port 67 or udp port 68'"
+  echo "     Zu sehen sein müssen DISCOVER/REQUEST der VM (MAC ${MAC:-?}) und OFFER/ACK"
+  echo "     des Servers mit 'your address <IP>'. Bleibt es stumm, sendet der Gast nichts."
+  echo "  4) Gast-Agent (wird seit diesem Build beim ersten Boot automatisch nachinstalliert):"
+  echo "       qm guest cmd ${VMID} ping"
+  echo "  5) DHCP-Server/Router prüfen: hat die MAC ${MAC:-?} eine Lease? Subnetz beachten -"
+  echo "     das VM-Netz muss nicht 192.168.x sein (Live-Fall: 10.120.1.x)."
+  echo "  6) Direkt in der Konsole nachsehen:"
+  echo "       qm terminal ${VMID}  ->  Login: root  ->  'ip a; networkctl status'"
+  return 0
+}
+
+# Orchestrierung der mehrstufigen IP-Ermittlung. Setzt bei Erfolg VM_IP
+# (global), sonst leeres VM_IP. Läuft unter set +e / QUIET_ERR=1 (der Aufrufer
+# setzt das) - "nichts gefunden" ist hier ein normales Zwischenergebnis,
+# kein Fehler. Jede Stufe meldet ihr Ergebnis klar, bevor die nächste startet.
+detect_vm_ip() {
+  VM_IP=""
+  DIAG_NO_TRAFFIC=0
+  DIAG_TAP_OK=0
+  local ip="" i=0 fdb_state="" qm_state=""
+  local stage1_deadline=0
+
+  # ── Stufe 1: Passiv pollen - Gast-Agent, ARP-Tabelle, Bridge-FDB ─────────
+  # Der Gast-Agent braucht nach dem Boot einige Sekunden (systemd startet ihn
+  # spät; die first-boot-Unit installiert ihn erst nach networkd). ARP lernt
+  # der Host automatisch, sobald der Gast sein DHCP macht. Nach Ablauf des
+  # Fensters wird NICHT aufgegeben, sondern mit Stufe 2 weitergemacht.
+  msg_info "Stufe 1/4: Passiv auf Gast-Agent/ARP warten (max. ${AGENT_WAIT_TIMEOUT}s, Poll alle ${AGENT_POLL_INTERVAL}s)..."
+  stage1_deadline=$(( SECONDS + AGENT_WAIT_TIMEOUT ))
+  while [ "$SECONDS" -lt "$stage1_deadline" ]; do
+    i=$((i + 1))
+    ip="$(agent_query_ip "$VMID")"
+    if [ -n "$ip" ]; then
+      VM_IP="$ip"
+      msg_ok "IP über den Gast-Agent ermittelt: ${VM_IP}"
+      return 0
+    fi
+    ip="$(arp_lookup "$MAC")"
+    if [ -n "$ip" ]; then
+      VM_IP="$ip"
+      msg_ok "IP aus der ARP-Tabelle ermittelt: ${VM_IP}"
+      return 0
+    fi
+    fdb_state="kein Eintrag"
+    if [ -n "$MAC" ] && command -v bridge >/dev/null 2>&1; then
+      if bridge fdb show br "$BRIDGE" 2>/dev/null | grep -qi "$MAC"; then
+        fdb_state="MAC an Bridge sichtbar (Gast sendet L2)"
+      fi
+    fi
+    if [ $((i % 6)) -eq 0 ]; then
+      qm_state="$(qm status "$VMID" 2>/dev/null || echo unbekannt)"
+      msg_info "... $((i * AGENT_POLL_INTERVAL))s / ${AGENT_WAIT_TIMEOUT}s | VM: ${qm_state} | Agent: keine Antwort | ARP: leer | FDB: ${fdb_state}"
+    fi
+    sleep "$AGENT_POLL_INTERVAL"
+  done
+  msg_warn "Stufe 1 ohne Erfolg: Gast-Agent antwortet nicht, ARP/FDB blieb ${AGENT_WAIT_TIMEOUT}s leer."
+  msg_warn "-> Fahre fort mit Stufe 2/3 (der Agent ist kein Muss - Cloud-Images bringen ihn erst nach der first-boot-Unit mit)."
+
+  # ── Stufe 2: statische Wunsch-IP verifizieren (Ping + SSH-Port) ──────────
+  if [ -n "$STATIC_CANDIDATE" ]; then
+    msg_info "Stufe 2/4: Prüfe statische Wunsch-IP ${STATIC_CANDIDATE} direkt (Ping + Port 22)..."
+    ip="$(try_static_ip "$STATIC_CANDIDATE")"
+    if [ -n "$ip" ]; then
+      VM_IP="$ip"
+      msg_ok "Statische IP antwortet auf SSH - übernommen: ${VM_IP}"
+      return 0
+    fi
+    msg_warn "Statische IP ${STATIC_CANDIDATE} antwortet nicht - fahre fort mit Stufe 3 (aktive Diagnose)."
+  else
+    msg_info "Stufe 2/4: Keine statische IP konfiguriert (ipconfig0 = DHCP) - übersprungen."
+  fi
+
+  # ── Stufe 3: aktive Runden (Ping-Sweep + ARP + tcpdump-Sniff) ────────────
+  msg_info "Stufe 3/4: Aktive Diagnose (${SNIFF_ROUNDS} Runden: Ping-Sweep, DHCP-Sniff ${SNIFF_DHCP_SECS}s, tcpdump je ${SNIFF_SECS}s)..."
+  active_discovery_rounds
+  if [ -n "$VM_IP" ]; then
+    return 0
+  fi
+
+  # ── Stufe 4: Tiefendiagnose (nur wenn der Gast komplett schweigt) ────────
+  if [ "$DIAG_NO_TRAFFIC" = "1" ] && [ "${DEEP_DIAG:-yes}" != "no" ]; then
+    run_deep_diagnosis
+  fi
+
+  return 0
+}
+# ==== IP-ERMITTLUNG: ENDE ====
+
+# ==== TTY-KONSOLE: BEGIN (auch von den Tests gesourct) ====
+# ============================================================================
+# Die VM-Konsole darf NIE ohne echtes Terminal geöffnet werden: 'qm terminal'
+# hängt stdin/stdout an socat, das tcgetattr auf beiden Filedeskriptoren
+# macht - ohne TTY stirbt es mit "Inappropriate ioctl for device"
+# (Live-Bug). Stattdessen: TTY-Gate + manuelle Anleitung, niemals crashen.
+# ============================================================================
+print_console_manual() {
+  local vmid="$1"
+  msg_info "Konsole manuell öffnen (dort einloggen und die IP ablesen):"
+  echo "    Proxmox-WebUI -> VM ${vmid} -> Console (xterm.js)"
+  echo "    oder auf dem Host:  qm terminal ${vmid}"
+  echo
+  echo "  In der Konsole nach dem Login (Benutzer: root) ausführen:"
+  echo "    ip a                                # zeigt die IP-Adresse der VM"
+  echo "    networkctl status                   # Netzwerk-Status im Gast"
+  echo "    cat /etc/systemd/network/89-pinokio.network"
+  echo "  Konsole verlassen: Strg+O (Anzeige lösen), dann Strg+Q (qm terminal beenden)"
+  return 0
+}
+
+open_vm_console() {
+  local vmid="$1"
+  # TTY-Gate: stdin UND stdout müssen ein Terminal sein, gemessen VOR der
+  # Log-Umleitung (in HAVE_TTY) - nach 'exec > >(tee ...)' wäre stdout eine
+  # Pipe und [ -t 1 ] dauerhaft false, obwohl ein Terminal existiert.
+  if [ "${HAVE_TTY:-0}" != "1" ]; then
+    msg_info "Kein interaktives Terminal erkannt - die Konsole wird NICHT automatisch geöffnet."
+    print_console_manual "$vmid"
+    return 0
+  fi
+  msg_info "Öffne die VM-Konsole in 3 Sekunden..."
+  sleep 3
+  # stdout/stderr dieses Skripts laufen zu diesem Zeitpunkt in die Log-Pipe
+  # (tee) - die Konsole wird deshalb explizit am echten Terminal (/dev/tty)
+  # angeschlossen. Fehlschlag ist kein Abbruch, sondern nur die Anleitung.
+  if qm terminal "$vmid" </dev/tty >/dev/tty 2>&1; then
+    return 0
+  fi
+  msg_warn "'qm terminal' wurde beendet oder konnte nicht gestartet werden - Anleitung folgt."
+  print_console_manual "$vmid"
+  return 0
+}
+# ==== TTY-KONSOLE: ENDE ====
 
 # ----------------------------------------------------------------------------
 # Schritt 1: Vorabprüfungen
@@ -152,7 +620,13 @@ START_VM="${START_VM:-yes}"
 WAIT_FOR_PINOKIO="${WAIT_FOR_PINOKIO:-yes}"   # ja = auf http://<IP>:42000 warten, bis Pinokio installiert ist
 PINOKIO_PORT="${PINOKIO_PORT:-42000}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-1800}"          # max. Wartezeit in Sekunden (30 min)
-IP_WAIT_TIMEOUT="${IP_WAIT_TIMEOUT:-600}"     # max. Wartezeit auf die VM-IP in Sekunden (10 min)
+# IP-Ermittlung (mehrstufig, siehe detect_vm_ip) - subnetz-unabhängig:
+AGENT_WAIT_TIMEOUT="${AGENT_WAIT_TIMEOUT:-${IP_WAIT_TIMEOUT:-120}}"  # Stufe 1: passives Polling (Agent/ARP/FDB), Sekunden
+AGENT_POLL_INTERVAL="${AGENT_POLL_INTERVAL:-5}"                      # Stufe 1: Poll-Intervall, Sekunden
+SNIFF_ROUNDS="${SNIFF_ROUNDS:-3}"                                    # Stufe 3: aktive Runden (Ping-Sweep + Sniff)
+SNIFF_DHCP_SECS="${SNIFF_DHCP_SECS:-15}"                             # Stufe 3: Fenster für DHCP-yiaddr-Sniff, Sekunden
+SNIFF_SECS="${SNIFF_SECS:-30}"                                       # Stufe 3: Fenster für generischen Sniff je Lauscher, Sekunden
+SNIFF_PAUSE="${SNIFF_PAUSE:-10}"                                     # Stufe 3: Pause zwischen den Runden, Sekunden
 PCI_HOSTPCI="${PCI_HOSTPCI:-}"           # z.B. "01:00" -> GPU direkt bei Erstellung durchreichen
 NONINTERACTIVE="${NONINTERACTIVE:-}"     # 1 = Assistent überspringen, nur ENV-Variablen/Standardwerte nutzen
 
@@ -251,7 +725,7 @@ GPU:       ${PCI_HOSTPCI:-keine}
 Jetzt erstellen?" 19 74 || { msg_err "Abgebrochen."; exit 1; }
 }
 
-if [ -z "$NONINTERACTIVE" ] && [ -t 0 ] && [ -t 1 ]; then
+if [ -z "$NONINTERACTIVE" ] && [ "$HAVE_TTY" = "1" ]; then
   if ! command -v whiptail >/dev/null 2>&1; then
     msg_info "Installiere whiptail für den interaktiven Assistenten..."
     apt-get install -y -qq whiptail >/dev/null 2>&1 || true
@@ -645,6 +1119,48 @@ EOF
   mkdir -p "$mnt/etc/cloud"
   touch "$mnt/etc/cloud/cloud-init.disabled"
 
+  # 5b) qemu-guest-agent beim ersten Boot nachinstallieren: Cloud-Images
+  # bringen ihn nicht mit, ohne ihn liefert 'qm guest cmd ... network-get-
+  # interfaces' nichts und die IP-Erkennung bleibt auf ARP/Sniffing beschränkt
+  # (Live-Fall: der Agent lief nie). Die Unit läuft bewusst NACH
+  # multi-user.target (der Oneshot darf Boot und Anmeldung nicht blockieren)
+  # und ist Best Effort: schlägt sie fehl, bleiben ARP/Sniff als Wege.
+  cat > "$mnt/usr/local/sbin/pinokio-install-guest-agent.sh" <<'EOF'
+#!/bin/sh
+# Installiert den QEMU-Gast-Agenten nach (mehrfache Versuche, Best Effort).
+# Der Agent erlaubt dem Proxmox-Host, die VM-IP sauber auszulesen
+# (qm guest cmd <vmid> network-get-interfaces).
+command -v qemu-ga >/dev/null 2>&1 && exit 0
+export DEBIAN_FRONTEND=noninteractive
+i=0
+while [ "$i" -lt 10 ]; do
+    if apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq qemu-guest-agent >/dev/null 2>&1; then
+        exit 0
+    fi
+    i=$((i + 1))
+    sleep 15
+done
+exit 0
+EOF
+  chmod 755 "$mnt/usr/local/sbin/pinokio-install-guest-agent.sh"
+  cat > "$mnt/etc/systemd/system/pinokio-install-guest-agent.service" <<'EOF'
+[Unit]
+Description=Pinokio: qemu-guest-agent nachinstallieren (Best Effort)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pinokio-install-guest-agent.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  # WICHTIG: Guest-absolute Zielpfade im Symlink (gleiche Falle wie bei networkd)
+  mkdir -p "$mnt/etc/systemd/system/multi-user.target.wants"
+  ln -sf /etc/systemd/system/pinokio-install-guest-agent.service \
+    "$mnt/etc/systemd/system/multi-user.target.wants/pinokio-install-guest-agent.service" 2>/dev/null || true
+
   # 6) Hinweis auf Konsole: IP nach Login sichtbar machen
   mkdir -p "$mnt/etc/issue.d" 2>/dev/null || true
   printf '\nPinokio-VM bereit. Netzwerk: %s (systemd-networkd)\n' "${PINOKIO_STATIC_IP:-DHCP}" > "$mnt/etc/issue.d/pinokio.issue" 2>/dev/null || true
@@ -670,82 +1186,43 @@ fi
 step 6 "VM starten"
 
 VM_IP=""
+MAC=""
+STATIC_CANDIDATE=""
 if [ "$START_VM" = "yes" ]; then
   qm start "$VMID"
   msg_ok "VM gestartet."
 
   # --------------------------------------------------------------------------
-  # Schritt 7: Auf IP-Adresse warten
+  # Schritt 7: Auf IP-Adresse warten (mehrstufig - siehe detect_vm_ip)
   # --------------------------------------------------------------------------
-  step 7 "Auf IP-Adresse warten"
+  step 7 "Auf IP-Adresse warten (mehrstufig)"
 
-  # Ab hier sind "noch keine IP", "grep findet nichts", "Agent noch nicht da"
+  # "Noch keine IP", "grep findet nichts", "Agent noch nicht da" sind hier
   # normale Zwischenergebnisse beim Warten - kein echter Fehler. set -e wird
-  # deshalb für diesen gesamten Erkennungsabschnitt gezielt deaktiviert und
-  # der ERR-Trap verstummt (QUIET_ERR), damit es keine Fehlerspam-Ausgaben gibt.
+  # deshalb für die gesamte Ermittlung deaktiviert und der ERR-Trap verstummt
+  # (QUIET_ERR), damit es keinen Fehlerspam gibt.
   set +e
   QUIET_ERR=1
 
-  MAC="$(qm config "$VMID" 2>/dev/null | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)"
-  MAX_WAIT_ITER=$((IP_WAIT_TIMEOUT / 5))   # Standard: 600s / 5s = 120 Iterationen = 10 Minuten
+  MAC="$(qm config "$VMID" 2>/dev/null | grep -oE '^net0:.*' | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1 || true)"
   msg_info "MAC-Adresse der VM: ${MAC:-unbekannt}"
-  msg_info "Hinweis: qemu-guest-agent ist im Cloud-Image ab Werk NICHT installiert –"
-  msg_info "die Erkennung läuft primär über ARP/Bridge-FDB/Tap-Sniff, der Agent ist nur Bonus."
-  # Statische IP aus IPCONFIG schon bekannt? Dann direkt als Kandidat merken (Verifikation folgt).
-  STATIC_CANDIDATE="$(echo "${IPCONFIG:-}" | grep -oE 'ip=[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | cut -d= -f2 | cut -d/ -f1 || true)"
-  if [ -n "${STATIC_CANDIDATE:-}" ]; then
-    msg_info "Statische Wunsch-IP laut IPCONFIG: ${STATIC_CANDIDATE} (wird nach Boot per Ping verifiziert, nicht blind übernommen)."
+  msg_info "Hinweis: qemu-guest-agent ist im Cloud-Image ab Werk NICHT installiert. Das"
+  msg_info "Image-Setup richtet eine first-boot-Unit ein, die ihn nachinstalliert - die"
+  msg_info "IP-Ermittlung läuft daher subnetz-unabhängig mehrstufig (siehe Stufen unten)."
+
+  # Statische Wunsch-IP: bevorzugt aus der erstellten VM-Konfig (ipconfig0)
+  # lesen, Fallback: IPCONFIG-ENV. Verifiziert wird sie erst in Stufe 2
+  # (Ping + Port 22), nie blind übernommen.
+  STATIC_CANDIDATE="$(qm config "$VMID" 2>/dev/null | awk '/^ipconfig0:/{print $2}' | grep -oE 'ip=[0-9]+(\.[0-9]+){3}' | cut -d= -f2 | head -1 || true)"
+  if [ -z "$STATIC_CANDIDATE" ] && [ -n "${IPCONFIG:-}" ]; then
+    STATIC_CANDIDATE="$(echo "$IPCONFIG" | grep -oE 'ip=[0-9]+(\.[0-9]+){3}' | cut -d= -f2 | head -1 || true)"
+  fi
+  if [ -n "$STATIC_CANDIDATE" ] && ! valid_ipv4 "$STATIC_CANDIDATE"; then
+    msg_warn "Statische Kandidaten-IP '${STATIC_CANDIDATE}' ist ungültig - verworfen."
+    STATIC_CANDIDATE=""
   fi
 
-  for i in $(seq 1 "$MAX_WAIT_ITER"); do
-    sleep 5
-
-    AGENT_STATE="nicht erwartet/fehlt (ok)"
-    IFACES_JSON="$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null)"
-    if [ -n "$IFACES_JSON" ]; then
-      AGENT_STATE="läuft"
-      VM_IP="$(echo "$IFACES_JSON" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for iface in data:
-    if iface.get("name") == "lo":
-        continue
-    for addr in iface.get("ip-addresses", []):
-        ip = addr.get("ip-address", "")
-        if addr.get("ip-address-type") == "ipv4" and not ip.startswith("127."):
-            print(ip)
-            sys.exit(0)
-' 2>/dev/null)"
-    fi
-
-    ARP_STATE="kein Eintrag"
-    FDB_STATE="kein Eintrag"
-    if [ -z "$VM_IP" ] && [ -n "$MAC" ]; then
-      VM_IP="$(ip neigh show 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1)"
-      if [ -n "$VM_IP" ]; then
-        ARP_STATE="gefunden"
-      fi
-    fi
-    # Bridge-FDB sieht die MAC oft früher als die ARP-Tabelle (L2 vs L3).
-    if [ -z "$VM_IP" ] && [ -n "$MAC" ] && command -v bridge >/dev/null 2>&1; then
-      if bridge fdb show br "$BRIDGE" 2>/dev/null | grep -qi "$MAC"; then
-        FDB_STATE="MAC an Bridge sichtbar (Gast sendet L2)"
-      fi
-    fi
-
-    if [ -n "$VM_IP" ]; then
-      break
-    fi
-
-    # Alle 30 Sekunden Status mit sichtbarem Fortschritt, WAS genau versucht wurde
-    if [ $((i % 6)) -eq 0 ]; then
-      QM_STATE="$(qm status "$VMID" 2>/dev/null || echo unbekannt)"
-      msg_info "... $((i * 5))s / ${IP_WAIT_TIMEOUT}s | ${QM_STATE} | Agent: ${AGENT_STATE} | ARP: ${ARP_STATE} | FDB: ${FDB_STATE}"
-    fi
-  done
+  detect_vm_ip
 
   set -e        # ab hier wieder normales Fehlverhalten
   QUIET_ERR=0
@@ -753,179 +1230,7 @@ for iface in data:
   if [ -n "$VM_IP" ]; then
     msg_ok "IP-Adresse gefunden: ${VM_IP}"
   else
-    msg_warn "ARP/FDB liefern nach $((MAX_WAIT_ITER * 5 / 60)) Minuten nichts (Agent ist optional und fehlt meist – das ist ok)."
-    # Statische Wunsch-IP zuerst direkt verifizieren (Ping + SSH-Port), bevor gesnifft wird.
-    if [ -n "${STATIC_CANDIDATE:-}" ]; then
-      msg_info "Prüfe statische Wunsch-IP ${STATIC_CANDIDATE} direkt (Ping + Port 22)..."
-      ping -c2 -W2 "${STATIC_CANDIDATE}" >/dev/null 2>&1 || true
-      if timeout 3 bash -c "</dev/tcp/${STATIC_CANDIDATE}/22" 2>/dev/null; then
-        VM_IP="${STATIC_CANDIDATE}"
-        msg_ok "Statische IP antwortet auf SSH – übernehme ${VM_IP}."
-      else
-        msg_warn "Statische IP ${STATIC_CANDIDATE} antwortet nicht auf SSH – fahre mit Sniffing fort."
-      fi
-    fi
-  if [ -z "$VM_IP" ]; then
-    msg_info "Starte aktive Diagnose: Lausche auf ${BRIDGE} und scanne das Subnetz..."
-
-    # tcpdump ggf. nachinstallieren (nicht kritisch, falls nicht möglich)
-    if ! command -v tcpdump >/dev/null 2>&1; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcpdump >/dev/null 2>&1 || true
-    fi
-
-    # Diagnosebereich: hier sind "nichts gefunden"-Ergebnisse normal -> Trap still
-    QUIET_ERR=1
-
-    # Ist der Tap-Geräte-Port der VM überhaupt an der Bridge angeschlossen?
-    TAP_DEV="tap${VMID}i0"
-    if ip link show "$TAP_DEV" >/dev/null 2>&1; then
-      if ip link show "$TAP_DEV" | grep -q "master ${BRIDGE}"; then
-        msg_ok "${TAP_DEV} ist an ${BRIDGE} angeschlossen."
-      else
-        msg_warn "Diagnose: ${TAP_DEV} existiert, hängt aber NICHT an ${BRIDGE}! (master: $(ip link show "$TAP_DEV" | grep -oE 'master [^ ]+' || echo 'keine'))"
-      fi
-    else
-      msg_warn "Diagnose: Tap-Gerät ${TAP_DEV} existiert nicht - VM-NIC nicht verbunden?"
-    fi
-
-    SNIFF_PACKETS=0
-    if [ -n "$MAC" ] && command -v tcpdump >/dev/null 2>&1; then
-      # 1) Direkt am Tap lauschen: Zeigt Pakete, die der GUEST selbst sendet
-      if ip link show "$TAP_DEV" >/dev/null 2>&1; then
-        msg_info "Lausche 20s direkt an ${TAP_DEV} (was sendet der Gast?)..."
-        VM_IP="$(sniff_vm_ip "$MAC" "$TAP_DEV" 20)"
-        if [ -n "$VM_IP" ]; then
-          msg_ok "IP aus dem Traffic des Gastes ermittelt: ${VM_IP}"
-        elif [ "${SNIFF_PACKETS:-0}" -eq 0 ]; then
-          DIAG_NO_TRAFFIC=1
-          msg_warn "Diagnose: Der Gast sendet NICHT EINMAL am Tap-Gerät (${TAP_DEV}) etwas."
-          msg_warn "=> Das Gast-Netzwerk ist tot (systemd-networkd startet nicht / kein DHCP-/statisch-Versuch)."
-          msg_warn "=> Bitte beim nächsten Lauf direkt nach VM-Start 'qm terminal ${VMID}' öffnen"
-          msg_warn "   und 'networkctl status; ip a; cat /etc/systemd/network/89-pinokio.network' posten."
-        else
-          DIAG_TAP_OK=1
-          msg_info "Der Gast sendet Pakete am Tap (${SNIFF_PACKETS} gesehen) - prüfe Bridge-Weiterleitung..."
-        fi
-      fi
-      # 2) Fallback: an der Bridge lauschen
-      if [ -z "$VM_IP" ] && [ "${DIAG_NO_TRAFFIC:-0}" != "1" ]; then
-        VM_IP="$(sniff_vm_ip "$MAC" "$BRIDGE" 20)"
-        if [ -n "$VM_IP" ]; then
-          msg_ok "IP aus dem Netzwerk-Traffic ermittelt: ${VM_IP}"
-        elif [ "${SNIFF_PACKETS:-0}" -eq 0 ] && [ "${DIAG_TAP_OK:-0}" = "1" ]; then
-          msg_warn "Diagnose: Gast sendet am Tap, aber NICHTS kommt an ${BRIDGE} an -"
-          msg_warn "=> Bridge-Weiterleitung/Firewall blockt (pve-firewall status prüfen!)."
-        fi
-      fi
-    fi
-
-    if [ -z "$VM_IP" ] && [ -n "$MAC" ]; then
-      msg_info "Ping-Sweep über das Subnetz der Bridge (dauert ~10s), danach erneuter ARP-Blick..."
-      ping_sweep
-      VM_IP="$(ip neigh show 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1 || true)"
-      [ -n "$VM_IP" ] && msg_ok "IP nach Ping-Sweep gefunden: ${VM_IP}"
-    fi
-
-    QUIET_ERR=0
-
-    # Tiefendiagnose: Wenn der Gast komplett schweigt, mounten wir seine Disk
-    # vom Host aus (read-only) und lesen die Cloud-Init-Logs des Gastes.
-    # Das liefert die definitve Ursache, ohne Login/Netzwerk zu benötigen.
-    if [ "${DIAG_NO_TRAFFIC:-0}" = "1" ] && [ "${DEEP_DIAG:-yes}" != "no" ]; then
-      msg_info "Tiefendiagnose: Stoppe VM, mounte Disk read-only, lese Gast-Logs..."
-      DEEP_FILE="/tmp/pinokio-deepdiag-${VMID}.txt"
-      MNT="/mnt/pinokio-diag"
-
-      (
-        set +e
-        qm stop "$VMID" >/dev/null 2>&1
-        SCASI_LINE="$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/{print $2}' | head -1)"
-        VOL_SPEC="${SCASI_LINE%%,*}"
-        VOL_DEV="$(pvesm path "$VOL_SPEC" 2>/dev/null)"
-        [ -z "$VOL_DEV" ] && exit 1
-        modprobe nbd max_part=16 >/dev/null 2>&1
-        NBD_DEV="$(find_free_nbd)"
-        [ -z "$NBD_DEV" ] && exit 1
-        VOL_FMT="$(qemu-img info --output=json "$VOL_DEV" 2>/dev/null | python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("format","raw"))
-except Exception:
-    print("raw")' 2>/dev/null)"
-        [ -z "$VOL_FMT" ] && VOL_FMT="raw"
-        qemu-nbd -c "$NBD_DEV" -f "$VOL_FMT" --read-only "$VOL_DEV" >/dev/null 2>&1
-        sleep 1
-        partprobe "$NBD_DEV" >/dev/null 2>&1
-        mkdir -p "$MNT"
-        ROOT_PART=""
-        for p in "${NBD_DEV}p1" "${NBD_DEV}p2" "${NBD_DEV}p15" "$NBD_DEV"; do
-          if [ -b "$p" ] && blkid -o value -s TYPE "$p" 2>/dev/null | grep -qE '^ext[234]$'; then
-            if mount -o ro "$p" "$MNT" 2>/dev/null; then ROOT_PART="$p"; break; fi
-          fi
-        done
-        {
-          echo "=== Root-Partition: ${ROOT_PART:-NICHT GEFUNDEN}"
-          echo
-          echo "=== Unsere Netzconfig (muss existieren): /etc/systemd/network/89-pinokio.network"
-          cat "$MNT/etc/systemd/network/89-pinokio.network" 2>&1 || echo "FEHLT!"
-          echo
-          echo "--- networkd enabled?"
-          ls -l "$MNT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>&1 || true
-          echo
-          echo "=== Ist cloud-init ueberhaupt installiert? (sollte disabled sein)"
-          ls -la "$MNT/usr/bin/cloud-init" 2>&1 || true
-          echo
-          echo "=== /etc/cloud Verzeichnis"
-          ls "$MNT/etc/cloud/" 2>&1 || true
-          ls "$MNT/etc/cloud/cloud.cfg.d/" 2>&1 || true
-          echo
-          echo "=== Netzwerk-Konfiguration im Gast"
-          echo "--- /etc/network/interfaces:"
-          cat "$MNT/etc/network/interfaces" 2>&1 || true
-          echo "--- /etc/network/interfaces.d/:"
-          ls "$MNT/etc/network/interfaces.d/" 2>&1 || true
-          cat "$MNT/etc/network/interfaces.d/"* 2>/dev/null || true
-          echo "--- /etc/netplan/:"
-          ls "$MNT/etc/netplan/" 2>&1 || true
-          cat "$MNT/etc/netplan/"* 2>/dev/null || true
-          echo
-          echo "=== /var/log/cloud-init.log (letzte 80 Zeilen)"
-          tail -80 "$MNT/var/log/cloud-init.log" 2>&1 || true
-          echo
-          echo "=== /var/log/cloud-init-output.log (letzte 50 Zeilen)"
-          tail -50 "$MNT/var/log/cloud-init-output.log" 2>&1 || true
-          echo
-          echo "=== /var/lib/cloud Struktur"
-          find "$MNT/var/lib/cloud" -maxdepth 3 2>&1 | head -40 || true
-        } > "$DEEP_FILE" 2>&1
-        umount "$MNT" >/dev/null 2>&1
-        qemu-nbd -d "$NBD_DEV" >/dev/null 2>&1
-      ) || true
-
-      qm start "$VMID" >/dev/null 2>&1 || true
-
-      if [ -s "$DEEP_FILE" ]; then
-        msg_ok "Gast-Logs extrahiert ($DEEP_FILE):"
-        echo -e "${C_STEP}──────────────── BEGINN GAST-DIAGNOSE ────────────────${C_RESET}"
-        cat "$DEEP_FILE"
-        echo -e "${C_STEP}───────────────── ENDE GAST-DIAGNOSE ─────────────────${C_RESET}"
-        msg_warn "Bitte diesen Abschnitt vollständig kopieren und beim Issue melden."
-      else
-        msg_warn "Tiefendiagnose fehlgeschlagen (nbd/mount nicht möglich?). Log manuell prüfen."
-      fi
-    fi
-
-    if [ -z "$VM_IP" ]; then
-      msg_warn "Konnte die IP-Adresse auch mit aktiver Diagnose nicht ermitteln."
-      if [ "${DIAG_NO_TRAFFIC:-0}" = "1" ]; then
-        msg_warn "Nächster Schritt: 'qm terminal ${VMID}' öffnen und prüfen:"
-        msg_warn "  networkctl status; ip a; cat /etc/systemd/network/89-pinokio.network"
-        msg_warn "Alternativ anderes OS testen: OS_IMAGE=ubuntu2404 beim Neuerstellen."
-      elif [ "${DIAG_DHCP_ONLY:-0}" = "1" ]; then
-        msg_warn "Nächster Schritt: VM neu erstellen MIT statischer IP, z.B.:"
-        msg_warn "  IPCONFIG=\"ip=<freie-IP>/24,gw=<Gateway>\" bash -c \"\$(curl -fsSL <create-vm-url>)\""
-      fi
-    fi
-    fi
+    msg_warn "Konnte die VM-IP nach Ausschöpfen aller Stufen nicht ermitteln (Details oben in Schritt 7)."
   fi
 fi
 
@@ -1042,35 +1347,42 @@ if [ "${PINOKIO_READY:-0}" = "1" ]; then
 fi
 
 if [ -z "$VM_IP" ]; then
-  msg_warn "Automatische IP-Erkennung fehlgeschlagen (kein DHCP über den Host sichtbar und/oder"
-  msg_warn "Gast-Agent noch nicht bereit). Öffne jetzt automatisch die Konsole - dort einfach"
-  msg_warn "einloggen und die IP selbst ablesen:"
+  echo
+  msg_warn "Automatische IP-Ermittlung nach allen Stufen erfolglos. Versucht wurden:"
+  msg_warn "  Stufe 1: Gast-Agent + ARP/FDB passiv gepollt (${AGENT_WAIT_TIMEOUT}s)"
+  msg_warn "  Stufe 2: statische Wunsch-IP ${STATIC_CANDIDATE:-nicht konfiguriert} per Ping + Port 22"
+  msg_warn "  Stufe 3: ${SNIFF_ROUNDS} aktive Runden (Ping-Sweep, DHCP-Sniff, tcpdump am Tap/${BRIDGE})"
+  if [ "${DIAG_NO_TRAFFIC:-0}" = "1" ]; then
+    msg_warn "  Befund: Der Gast sendet KEINEN Traffic am Tap - Gast-Netzwerk vermutlich tot"
+    msg_warn "          (Details in der Tiefendiagnose oben und in ${LOG_FILE})."
+  else
+    msg_warn "  Befund: Der Gast sendet Traffic, aber es war keine verwertbare IPv4 erkennbar."
+  fi
+  echo
+  msg_info "Nächster Schritt: Konsole öffnen, einloggen und die IP selbst ablesen:"
   echo
   echo "    Login:    root"
   echo "    Passwort: ${CONSOLE_PASSWORD}"
   echo
   msg_warn "WICHTIG: Passwort/Keys wurden direkt ins Image geschrieben und sind ab dem"
-  msg_warn "ersten Boot aktiv - kein Warten auf cloud-init nötig."
+  msg_warn "ersten Boot aktiv - kein Warten auf cloud-init nötig (cloud-init ist bewusst deaktiviert)."
   echo
   echo "  In der Konsole nach dem Login ausführen:"
   echo "    ip a                              # zeigt die IP-Adresse"
-  echo "    cloud-init status                 # zeigt, ob Cloud-Init noch läuft oder fehlgeschlagen ist"
-  echo "    journalctl -u cloud-init -b       # Details bei Fehlern"
+  echo "    networkctl status                 # Netzwerk-Status im Gast"
+  echo "    cat /etc/systemd/network/89-pinokio.network"
+  echo "    journalctl -u systemd-networkd -b # Details, wenn enp*/eth* keine IP hat"
   echo
   echo "  Konsole verlassen mit: Strg+O, dann Strg+Q"
   echo
-  msg_info "Öffne Konsole in 3 Sekunden..."
-  sleep 3
-  if [ -t 0 ]; then
-    qm terminal "$VMID" || true
-  else
-    msg_warn "Kein interaktives Terminal (Skript lief per curl|bash) - Konsole manuell öffnen:"
-    msg_warn "  Proxmox-WebUI -> VM ${VMID} -> Console   oder:   qm terminal ${VMID}"
-  fi
+  print_ip_failure_checklist
   echo
-  msg_info "Sobald du die IP kennst, Pinokio installieren mit:"
+  open_vm_console "$VMID"
+  echo
+  msg_info "Sobald du die IP kennst, Pinokio auf dem Host ausrollen mit:"
   echo "    curl -fsSL ${INSTALL_SCRIPT_URL} -o /tmp/i.sh && ssh -i ${SSH_PUBKEY_FILE%.pub} root@<VM-IP> 'bash -s' < /tmp/i.sh"
-  echo "    http://<VM-IP>:42000"
+  echo "    Danach erreichbar unter: http://<VM-IP>:42000"
+  echo "    Später auf dem Host (Update/Status): curl -fsSL ${INSTALL_SCRIPT_URL} | ssh -i ${SSH_PUBKEY_FILE%.pub} root@<VM-IP> 'bash -s -- --update'"
   exit 0
 fi
 
