@@ -17,7 +17,7 @@ die VM keinen Monitor, keine Tastatur und keine grafische Sitzung braucht.
 | Skript | Läuft auf | Zweck |
 |---|---|---|
 | `create-vm.sh` | Proxmox-**Host** | Erstellt die komplette VM (Cloud-Image, q35+OVMF, direkt vorkonfiguriert – ohne auf Cloud-Init angewiesen zu sein) und installiert Pinokio per SSH |
-| `install.sh` | in der **VM** | Installiert Pinokio als Server-Dienst. Wird von `create-vm.sh` automatisch aufgerufen – manueller Aufruf ist nur nötig, wenn du die VM selbst erstellt hast |
+| `install.sh` | in der **VM** | Installiert Pinokio als Server-Dienst (Modi: Installation/Update, `--status`, `--uninstall`, `--debug`). Wird von `create-vm.sh` automatisch aufgerufen – manueller Aufruf ist nur nötig, wenn du die VM selbst erstellt hast. Auf einem Proxmox-**Host** erkannt, verweigert es bewusst die Ausführung und leitet zu `create-vm.sh` weiter |
 
 `create-vm.sh`:
 - Lädt automatisch ein offizielles Debian/Ubuntu Cloud-Image herunter (gecacht,
@@ -44,14 +44,20 @@ die VM keinen Monitor, keine Tastatur und keine grafische Sitzung braucht.
 - Optional: kann eine GPU direkt bei der Erstellung durchreichen (`PCI_HOSTPCI=...`)
 
 `install.sh`:
+- Erkennt, ob es auf einem Proxmox-Host läuft (`pveversion` vorhanden): dann wird
+  **nichts** auf den Hypervisor installiert – interaktiv fragt es, ob `create-vm.sh`
+  direkt gestartet werden soll, ohne TTY bricht es mit der exakten Anleitung ab
 - Erkennt die GPU (NVIDIA/AMD/Intel) und installiert passende Treiber/Firmware
 - Legt einen eigenen, unprivilegierten Systembenutzer `pinokio` an
 - Lädt automatisch die **jeweils neueste** Pinokio-Version von GitHub herunter und installiert sie
+  (Versionsermittlung tolerant gegenüber GitHub-API-Ausfällen: API → Redirect-Fallback;
+  Downloads mit `--retry`, halbe `.deb`-Dateien werden per `trap` aufgeräumt)
 - Konfiguriert Pinokio vor (`~/.pinokio/config.json`), sodass **keine grafische
   Ersteinrichtung nötig ist** – der Webserver läuft direkt nach dem Start
 - Richtet drei systemd-Dienste ein: `pinokio-xvfb`, `pinokio` und `pinokio-vnc` (nur als Fallback)
 - Wartet am Ende, bis der Webserver auf Port 42000 antwortet, und zeigt die URL an
 - Öffnet bei aktivem `ufw` automatisch Port 42000
+- Ist idempotent: erneutes Ausführen aktualisiert auf die neueste Version und startet die Dienste neu
 
 ## Voraussetzungen
 
@@ -93,7 +99,16 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Pr
 
 Das erstellt VM, Betriebssystem und Pinokio-Installation komplett automatisch und
 **wartet am Ende, bis der Pinokio-Server unter `http://<VM-IP>:42000` erreichbar
-ist** – die finale URL wird groß ausgegeben. Alle Werte sind per
+ist** – die finale URL wird groß ausgegeben.
+
+> Tipp: Auch der klassische `install.sh`-Einzeiler ist auf dem Host "sicher": läuft er
+> auf einem Proxmox-Host (`pveversion` vorhanden), installiert er **nicht** Pinokio auf
+> den Hypervisor, sondern fragt interaktiv, ob `create-vm.sh` gleich gestartet werden
+> soll (ohne TTY, z.B. `curl | bash`, bricht er sauber mit der Anleitung ab).
+> Umgebungsvariablen wie `CORES=8 NONINTERACTIVE=1` werden dabei an `create-vm.sh`
+> durchgereicht.
+
+Alle Werte sind per
 Umgebungsvariable vor dem Aufruf anpassbar:
 
 Wird `create-vm.sh` **interaktiv an einem Terminal** ausgeführt (also nicht in
@@ -241,7 +256,24 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Pr
 ```
 
 Das Skript erkennt automatisch die GPU, installiert bei Bedarf Treiber, lädt die
-aktuellste Pinokio-Version herunter und startet den Dienst. Falls GPU-Treiber
+aktuellste Pinokio-Version herunter und startet den Dienst. Läuft auch ohne TTY
+(z.B. `curl -fsSL .../install.sh | bash`). Optionen:
+
+```bash
+# Update (identisch zur erneuten Installation – idempotent):
+bash -c "$(curl -fsSL .../install.sh)" -- --update
+
+# Status der Dienste + Version + URL (kein root nötig):
+bash -c "$(curl -fsSL .../install.sh)" -- --status
+
+# Deinstallieren (Apps/Modelle bleiben; mit --purge-data alles löschen):
+bash -c "$(curl -fsSL .../install.sh)" -- --uninstall [--purge-data]
+
+# Fehlerdiagnose: jeder ausgeführte Befehl sichtbar (bash -x):
+bash -c "$(curl -fsSL .../install.sh)" -- --debug
+```
+
+Falls GPU-Treiber
 installiert wurden, am Ende einmal neu starten:
 ```bash
 reboot
@@ -299,10 +331,11 @@ das ist sein Zweck (Installation/Ausführung von KI-Apps). Netzwerkzugriff auf P
 
 ## Aktualisieren
 
-Das Installationsskript ist idempotent – einfach erneut ausführen, um auf die
-neueste Pinokio-Version zu aktualisieren:
+Das Installationsskript ist idempotent – einfach erneut ausführen (oder explizit mit
+`--update`), um auf die neueste Pinokio-Version zu aktualisieren; die Dienste werden
+dabei neu gestartet:
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/install.sh)" -- --update
 ```
 
 ## Troubleshooting
@@ -351,10 +384,18 @@ qm destroy <VMID>
 
 ## Pinokio deinstallieren (VM bleibt bestehen)
 
+Entweder das separate Skript:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/uninstall.sh -o uninstall.sh
 bash uninstall.sh              # Apps/Modelle bleiben erhalten
 bash uninstall.sh --purge-data # löscht zusätzlich alle Apps/Modelle
+```
+
+oder direkt über `install.sh` (gleiches Ergebnis):
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Proxmox/main/install.sh)" -- --uninstall [--purge-data]
 ```
 
 ## Contributing
