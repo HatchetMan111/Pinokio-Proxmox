@@ -35,18 +35,41 @@ die VM keinen Monitor, keine Tastatur und keine grafische Sitzung braucht.
 - Läuft interaktiv an einem Terminal automatisch als Auswahl-Assistent (whiptail,
   wie bei den Proxmox Community-Scripts) – Maschinentyp, OS, Ressourcen, Storage,
   Bridge, IP-Konfiguration und optional GPU lassen sich dort auswählen, ohne
-  Umgebungsvariablen von Hand zu setzen
-- Findet die IP auch ohne Gast-Agent (der ist in Cloud-Images ab Werk nicht drin):
-  aktive Diagnose per ARP + Bridge-FDB + `tcpdump`-Mithören am Tap-Gerät/an der Bridge,
-  Ping-Sweep des Subnetzes, statische `IPCONFIG` wird per Ping/SSH verifiziert, und als
-  letzte Eskalationsstufe eine Tiefendiagnose (Disk read-only mounten, echte
-  Gast-Netzconfig `/etc/systemd/network/89-pinokio.network` + Logs auslesen)
+  Umgebungsvariablen von Hand zu setzen. Ohne TTY (z.B. `curl | bash` oder in
+  Automationen) wird nie interaktiv gefragt und nie eine Konsole automatisch
+  geöffnet – stattdessen erscheint eine klare Textanleitung
+- Findet die IP subnetz-unabhängig (das VM-Netz muss kein 192.168.x sein) und
+  mehrstufig: (1) passives Polling von Gast-Agent/ARP/Bridge-FDB, (2) statische
+  `ipconfig0` per Ping + SSH verifizieren, (3) mehrere aktive Runden mit
+  Ping-Sweep, DHCP-yiaddr-Mithören und `tcpdump` am Tap/an der Bridge, (4) als
+  Eskalationsstufe eine Tiefendiagnose (Disk read-only mounten, echte
+  Gast-Netzconfig `/etc/systemd/network/89-pinokio.network` + Logs auslesen).
+  Am Ende steht bei Erfolglosigkeit eine gezielte Checkliste (Bridge prüfen,
+  DHCP-Verkehr mithören, Lease am Router, Gast-Agent, Konsole)
+- Richtet eine first-boot-Unit ein, die `qemu-guest-agent` in der VM
+  nachinstalliert (Cloud-Images bringen ihn nicht mit) – damit liefert der
+  Gast-Agent künftig die IP zuverlässig direkt an den Host
+- Die automatische Konsolenöffnung (`qm terminal`) passiert nur bei echtem
+  Terminal auf stdin UND stdout; sonst (und bei jedem Fehler) gibt das Skript
+  die manuelle Anleitung aus und crasht nie
 - Optional: kann eine GPU direkt bei der Erstellung durchreichen (`PCI_HOSTPCI=...`)
 
 `install.sh`:
 - Erkennt, ob es auf einem Proxmox-Host läuft (`pveversion` vorhanden): dann wird
   **nichts** auf den Hypervisor installiert – interaktiv fragt es, ob `create-vm.sh`
   direkt gestartet werden soll, ohne TTY bricht es mit der exakten Anleitung ab
+- Installiert in KVM/QEMU-VMs automatisch den `qemu-guest-agent` (hilft der
+  IP-Erkennung auf dem Proxmox-Host)
+- Installiert die kompletten Electron-Laufzeit-Bibliotheken vorab (die Pinokio-.deb
+  deklariert sie nicht selbst; auf minimalen Cloud-Images crashte der Dienst sonst
+  mit Exit 127) und verifiziert nach der Installation per `ldd`, dass alle
+  Bibliotheken auflösbar sind – bricht sonst mit den konkreten fehlenden
+  Bibliotheksnamen ab
+- Schaltet Pinokios optionalen Secure-Localhost-/HTTPS-Modus ab
+  (`PINOKIO_HTTPS_ACTIVE=0` im systemd-Unit): der zugehörige Dialog fragt nach
+  einem Systempasswort, das der Dienstbenutzer `pinokio` bewusst nicht hat.
+  Die Web-UI läuft bewusst per HTTP auf Port 42000; falls der Dialog trotzdem
+  erscheint, einfach abbrechen
 - Erkennt die GPU (NVIDIA/AMD/Intel) und installiert passende Treiber/Firmware
 - Legt einen eigenen, unprivilegierten Systembenutzer `pinokio` an
 - Lädt automatisch die **jeweils neueste** Pinokio-Version von GitHub herunter und installiert sie
@@ -95,7 +118,9 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Pr
 
 > Wichtig: unbedingt `bash -c "$(curl …)"` nutzen, **nicht** `curl … | bash` – nur so
 > hat der whiptail-Auswahl-Assistent ein Terminal. Log läuft mit unter
-> `/var/log/pinokio-create-vm-<VMID>.log`.
+> `/var/log/pinokio-create-vm-<VMID>.log`. Ohne TTY funktioniert der Lauf trotzdem
+> definiert: kein Assistent, keine automatische Konsolenöffnung, dafür klare
+> Textanleitungen (und nie ein `qm terminal`-Crash).
 
 Das erstellt VM, Betriebssystem und Pinokio-Installation komplett automatisch und
 **wartet am Ende, bis der Pinokio-Server unter `http://<VM-IP>:42000` erreichbar
@@ -133,7 +158,12 @@ nicht-interaktive Nutzung bzw. zum Vorbelegen von Standardwerten relevant:
 | `PCI_HOSTPCI` | *(leer)* | z.B. `01:00`, um die GPU direkt mitzugeben |
 | `WAIT_FOR_PINOKIO` | `yes` | `no` = nach dem VM-Start nicht auf Port 42000 warten |
 | `WAIT_TIMEOUT` | `1800` | max. Wartezeit auf den Pinokio-Server in Sekunden |
-| `IP_WAIT_TIMEOUT` | `600` | max. Wartezeit auf die VM-IP in Sekunden, bevor die aktive Diagnose startet |
+| `AGENT_WAIT_TIMEOUT` | `120` | IP-Erkennung Stufe 1: wie lange passiv auf Gast-Agent/ARP gepollt wird (Sekunden; der Legacy-Alias `IP_WAIT_TIMEOUT` wird weiterhin gelesen) |
+| `AGENT_POLL_INTERVAL` | `5` | Poll-Intervall der passiven IP-Erkennung (Sekunden) |
+| `SNIFF_ROUNDS` | `3` | IP-Erkennung Stufe 3: Anzahl aktiver Runden (Ping-Sweep + DHCP-Sniff + tcpdump + ARP) |
+| `SNIFF_DHCP_SECS` | `15` | Dauer des DHCP-yiaddr-Sniffs pro Runde (Sekunden) |
+| `SNIFF_SECS` | `30` | Dauer des generischen tcpdump-Sniffs pro Lauscher (Sekunden) |
+| `SNIFF_PAUSE` | `10` | Pause zwischen den aktiven Runden (Sekunden) |
 | `IMG_REDOWNLOAD` | *(leer)* | `yes` = gecachtes Cloud-Image verwerfen und neu herunterladen (bei Verdacht auf einen beschädigten Cache) |
 | `NONINTERACTIVE` | *(leer)* | `1` = Auswahl-Assistent überspringen, nur ENV-Variablen/Standardwerte nutzen |
 
@@ -363,14 +393,29 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/Pinokio-Pr
   Danach in der Proxmox-Weboberfläche die Konsole neu öffnen – sie zeigt jetzt
   wieder normal Text/Boot-Meldungen an. Neu erstellte VMs sind davon nicht mehr
   betroffen.
-- VM bekommt beim ersten Boot keine IP: `create-vm.sh` eskaliert das inzwischen
-  automatisch selbst – nach `IP_WAIT_TIMEOUT` (Standard 10 Min.) startet es aktive
-  Diagnose (ARP + Bridge-FDB, `tcpdump` am Tap-Gerät/an der Bridge, Ping-Sweep) und
-  zeigt am Ende bei Bedarf die Gast-Netzconfig (`/etc/systemd/network/89-pinokio.network`,
-  per read-only Disk-Mount) an. Volles Log: `/var/log/pinokio-create-vm-<VMID>.log`.
+- VM bekommt beim ersten Boot keine IP: `create-vm.sh` ermittelt die IP mehrstufig
+  und subnetz-unabhängig – erst passives Polling von Gast-Agent/ARP/FDB
+  (`AGENT_WAIT_TIMEOUT`, Standard 120 s), dann aktive Runden (Ping-Sweep,
+  DHCP-yiaddr-Mithören, `tcpdump` am Tap/an der Bridge), bei totalem Funkstille
+  eine Tiefendiagnose (Gast-Netzconfig per read-only Disk-Mount) und am Ende eine
+  gezielte Checkliste. Volles Log: `/var/log/pinokio-create-vm-<VMID>.log`.
+  Wichtig: das VM-Subnetz muss nicht dem "üblichen" 192.168.x entsprechen
+  (Live-Fall: 10.120.1.x) – die Erkennung filtert bewusst nicht nach Präfixen.
+  Hat die Bridge keine IPv4, kann der Host keine ARP-Einträge lernen – dann
+  tragen Tap-Sniff und Gast-Agent (wird per first-boot-Unit nachinstalliert).
   In der VM selbst hilft: `networkctl status; ip a; cat /etc/systemd/network/89-pinokio.network`.
   Alternativ manuell: `qm terminal <VMID>` (Login: `root`, Passwort steht in der Skript-Ausgabe unter
   "Konsolen-PW" – funktioniert nur lokal über die Konsole, nicht per SSH)
+- Pinokio-Web-UI fragt nach "System password to generate an HTTPS certificate":
+  einfach abbrechen. Das ist Pinokios optionaler Secure-Localhost-Modus – der
+  Installer schaltet ihn per `PINOKIO_HTTPS_ACTIVE=0` im systemd-Unit ab, da der
+  Dienstbenutzer `pinokio` bewusst kein Passwort hat. HTTP auf Port 42000 ist der
+  vorgesehene Weg (siehe Sicherheitshinweis)
+- Pinokio-Dienst crasht mit Exit 127 ("error while loading shared libraries"):
+  `install.sh` installiert die Electron-Laufzeit-Bibliotheken vorab und prüft per
+  `ldd`; falls trotzdem eine fehlt, nennt die Healthcheck-Ausgabe die konkrete
+  Bibliothek. Manuell: fehlendes Paket installieren (z.B. `apt-get install -y
+  libasound2` – Ubuntu 24.04: `libasound2t64`) und `systemctl restart pinokio`
 - Bei wiederholten, unerklärlichen Fehlern im Gast (fehlende Pakete, kein Netzwerk
   trotz allem): das gecachte Cloud-Image könnte beschädigt sein. Mit
   `IMG_REDOWNLOAD=yes` beim nächsten Lauf erzwingt man einen frischen Download.
