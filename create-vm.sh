@@ -157,6 +157,7 @@ sniff_dhcp_offer() {
 # in der ARP-Tabelle des Hosts landet. Danach lohnt ein erneuter arp-Blick.
 ping_sweep() {
   local cidr net prefix base i
+  local pids=()
   cidr="$(ip -4 -o addr show dev "${BRIDGE}" 2>/dev/null | awk '{print $4; exit}' || true)"
   [ -z "$cidr" ] && return 0
   prefix="${cidr#*/}"
@@ -165,8 +166,16 @@ ping_sweep() {
   base="${net%.*}"
   for i in $(seq 1 254); do
     ping -c1 -W1 "${base}.${i}" >/dev/null 2>&1 &
+    pids+=("$!")
   done
-  wait 2>/dev/null || true
+  # NUR auf die Pings warten, nie blankes 'wait': Die Log-Umleitung
+  # 'exec > >(tee ...)' erzeugt ein tee-Kindprozess, das so lange lebt wie
+  # das Script selbst - ein blankes 'wait' wartet auch darauf = Deadlock
+  # (Live-Hänger 2026-11-09 bei 'Aktive Runde 1/3', isoliert per Repro:
+  # tee + wait ohne Pings haengt, Pings ohne tee kehren sofort zurueck).
+  if [ "${#pids[@]}" -gt 0 ]; then
+    wait "${pids[@]}" 2>/dev/null || true
+  fi
   return 0
 }
 
